@@ -14,8 +14,8 @@
   <body>
     <main class="plate">
       <header class="plate-head">
-        <p class="plate-no">Plate I</p>
-        <h1>The Hand in Dupuytren&rsquo;s Contracture</h1>
+        <p class="plate-no" id="plate-no">Plate I</p>
+        <h1 id="plate-title">The Hand in Dupuytren&rsquo;s Contracture</h1>
       </header>
 
       <figure class="figure">
@@ -26,18 +26,33 @@
 
       <aside class="panel" aria-label="Configure the contracture">
         <section>
+          <div class="modes" id="modes" role="tablist">
+            <button data-mode="clinic" role="tab">Clinic</button>
+            <button data-mode="theatre" role="tab">Theatre</button>
+          </div>
+        </section>
+
+        <section id="theatre" class="theatre-only">
+          <h2>Operation</h2>
+          <div id="op-finger"></div>
+          <ol id="op-steps" class="steps"></ol>
+          <p id="op-instruction" class="instruction"></p>
+          <div id="op-actions" class="actions"></div>
+        </section>
+
+        <section class="clinic-only">
           <h2>Digits</h2>
           <p class="hint">Mark the affected fingers, then choose one to adjust.</p>
           <ul id="fingers" class="fingers"></ul>
         </section>
 
-        <section id="joints">
+        <section id="joints" class="clinic-only">
           <h2 id="joints-title">Ring finger</h2>
           <div id="sliders"></div>
           <p id="stage" class="stage"></p>
         </section>
 
-        <section>
+        <section class="clinic-only">
           <h2>Palm cord</h2>
           <div id="cord"></div>
         </section>
@@ -53,7 +68,15 @@
           <p class="hint">Drag to turn the model; scroll or pinch to zoom.</p>
         </section>
 
-        <section class="note">
+        <section class="note theatre-only">
+          <p>
+            In a fasciectomy the diseased cord is cut out through the palm. Closing the skin with a
+            Z-plasty swaps two triangular flaps so the scar zig-zags across the line of the finger,
+            lengthening the skin instead of leaving a straight scar that could tighten into a new band.
+          </p>
+        </section>
+
+        <section class="note clinic-only">
           <p>
             In Dupuytren&rsquo;s disease the palmar fascia thickens into nodules and cords. As a cord
             contracts it draws the finger into flexion at the knuckle (MCP) and middle joint (PIP),

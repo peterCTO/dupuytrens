@@ -1,5 +1,6 @@
 import './style.css';
 import { HandView, ViewName } from './scene';
+import { Theatre } from './theatre';
 import {
   FINGER_IDS,
   FINGER_LABELS,
@@ -19,6 +20,36 @@ view.onBusy = (busy) => {
   document.getElementById('busy')!.hidden = !busy;
 };
 view.onAspect = () => renderCaption();
+
+type Mode = 'clinic' | 'theatre';
+let mode: Mode = 'clinic';
+const theatre = new Theatre(
+  view,
+  () => pose,
+  (p, structural) => {
+    Object.assign(pose, JSON.parse(JSON.stringify(p)));
+    view.setPose(pose, structural);
+    renderCaption();
+  },
+);
+theatre.onChange = () => renderCaption();
+
+function setMode(m: Mode) {
+  if (m === mode) return;
+  mode = m;
+  document.body.dataset.mode = m;
+  const theatreMode = m === 'theatre';
+  document.getElementById('plate-no')!.textContent = theatreMode ? 'Plate II' : 'Plate I';
+  document.getElementById('plate-title')!.innerHTML = theatreMode ? 'Fasciectomy with Z-plasty' : 'The Hand in Dupuytren&rsquo;s Contracture';
+  for (const b of document.querySelectorAll<HTMLButtonElement>('#modes button')) b.classList.toggle('active', b.dataset.mode === m);
+  if (theatreMode) theatre.enter(active);
+  else {
+    theatre.leave();
+    renderFingers();
+    renderSliders();
+  }
+  renderCaption();
+}
 
 const JOINTS = [
   { key: 'mcp', label: 'MCP', name: 'knuckle', min: 0, max: 90 },
@@ -200,7 +231,10 @@ function renderCaption() {
     what = `Dupuytren’s contracture of ${list}`;
   }
   const aspect = view.aspect();
-  document.getElementById('caption')!.innerHTML = `<span class="fig">Fig. 1.</span> Right hand, ${ASPECT_NAMES[aspect]}, showing ${what}${cordText}.`;
+  document.getElementById('caption')!.innerHTML =
+    mode === 'theatre'
+      ? `<span class="fig">Fig. 2.</span> ${theatre.caption()}`
+      : `<span class="fig">Fig. 1.</span> Right hand, ${ASPECT_NAMES[aspect]}, showing ${what}${cordText}.`;
   for (const b of document.querySelectorAll<HTMLButtonElement>('#views button')) {
     b.classList.toggle('active', b.dataset.view === aspect);
   }
@@ -225,6 +259,11 @@ function update(structural: boolean) {
 for (const b of document.querySelectorAll<HTMLButtonElement>('#views button')) {
   b.addEventListener('click', () => view.goTo(b.dataset.view as ViewName));
 }
+for (const b of document.querySelectorAll<HTMLButtonElement>('#modes button')) {
+  b.addEventListener('click', () => setMode(b.dataset.mode as Mode));
+}
+document.body.dataset.mode = 'clinic';
+document.querySelector<HTMLButtonElement>('#modes button[data-mode="clinic"]')!.classList.add('active');
 
 renderFingers();
 renderSliders();
@@ -235,3 +274,9 @@ const params = new URLSearchParams(location.search);
 const initial = params.get('view') as ViewName | null;
 if (initial && initial in ASPECT_NAMES) view.goTo(initial, true);
 if (params.get('zoom')) view.zoom(Number(params.get('zoom')));
+// ?mode=theatre&step=excise jumps straight to a step, for screenshots.
+if (params.get('mode') === 'theatre') {
+  setMode('theatre');
+  const step = params.get('step');
+  if (step) theatre.skipTo(step);
+}

@@ -6,7 +6,7 @@
 // creases of a real hand without a hand-sculpted mesh, and lets the pose be
 // rebuilt exactly for any finger angles.
 
-import { Skeleton, Vec3, Segment, norm, cross, dot } from './anatomy';
+import { Skeleton, Vec3, Segment, Wound, norm, cross, dot } from './anatomy';
 
 interface Cone {
   ax: number; ay: number; az: number;
@@ -47,12 +47,50 @@ export interface Field {
   digits: DigitField[];
   cords: Cone[];
   nodules: Ellipsoid[];
+  wound: WoundField | null;
   cutY: number;
   min: Vec3;
   max: Vec3;
 }
 
 export const CUT_Y = -3.0;
+
+/** An open wound: a bowl-shaped ellipse cut down to the level of the cord. */
+export interface WoundField {
+  /** Centre, unit axis along the ray, half length and half width, in the palm plane. */
+  cx: number; cy: number; ux: number; uy: number;
+  rx: number; ry: number;
+  floor: number;
+  /** The ray's cords, laid bare in the wound. */
+  cords: Cone[];
+}
+
+function woundField(w: Wound, cords: Cone[]): WoundField {
+  const dx = w.b[0] - w.a[0], dy = w.b[1] - w.a[1];
+  const len = Math.hypot(dx, dy);
+  return {
+    cx: (w.a[0] + w.b[0]) / 2, cy: (w.a[1] + w.b[1]) / 2,
+    ux: dx / len, uy: dy / len,
+    rx: len / 2 + 0.3, ry: w.halfWidth,
+    floor: w.floor,
+    cords,
+  };
+}
+
+/**
+ * Signed distance to the hollow of the wound (negative inside it). The walls
+ * slope in towards the floor, as skin and fat do when held apart.
+ */
+export function woundCavity(w: WoundField, x: number, y: number, z: number): number {
+  const px = x - w.cx, py = y - w.cy;
+  const u = px * w.ux + py * w.uy;
+  const v = -px * w.uy + py * w.ux;
+  const open = 0.7 + 0.3 * smoothstep(w.floor, w.floor + 0.9, z);
+  const rx = w.rx * (0.8 + 0.2 * open), ry = w.ry * open;
+  const k = Math.hypot(u / rx, v / ry);
+  const e = (k - 1) * Math.min(rx, ry);
+  return Math.max(e, w.floor - z);
+}
 
 function makeCone(a: Vec3, b: Vec3, r1: number, r2: number): Cone {
   const bx = b[0] - a[0], by = b[1] - a[1], bz = b[2] - a[2];
@@ -193,12 +231,15 @@ export function buildField(sk: Skeleton): Field {
 
   const cords: Cone[] = [];
   const nodules: Ellipsoid[] = [];
+  const exposed: Cone[] = [];
   for (const c of sk.cords) {
     for (let i = 0; i + 1 < c.points.length; i++) {
       // Cords fade into the palmar fascia at their proximal end and are
       // thickest where they cross the knuckle.
       const first = i === 0;
-      cords.push(makeCone(c.points[i], c.points[i + 1], c.radius * (first ? 0.45 : 0.9), c.radius * (first ? 1.0 : 0.75)));
+      const cone = makeCone(c.points[i], c.points[i + 1], c.radius * (first ? 0.45 : 0.9), c.radius * (first ? 1.0 : 0.75));
+      cords.push(cone);
+      if (sk.wound && c.finger === sk.wound.finger) exposed.push(cone);
     }
     if (c.nodule) nodules.push(makeEllipsoid(c.nodule, [0.48, 0.62, 0.26], [1, 0, 0], c.noduleAxis));
   }
@@ -214,7 +255,8 @@ export function buildField(sk: Skeleton): Field {
       }
     }
   }
-  return { palmCones, palmEllipsoids, forearm, webs, hollow, digits, cords, nodules, cutY: CUT_Y, min, max };
+  const wound = sk.wound ? woundField(sk.wound, exposed) : null;
+  return { palmCones, palmEllipsoids, forearm, webs, hollow, digits, cords, nodules, wound, cutY: CUT_Y, min, max };
 }
 
 export function sdDigitCones(f: DigitField, x: number, y: number, z: number): number {
@@ -296,7 +338,8 @@ function sdPalm(fd: Field, x: number, y: number, z: number): number {
   return d;
 }
 
-export function sdf(fd: Field, x: number, y: number, z: number): number {
+/** The hand before any wound is cut into it, without the display cut at the wrist. */
+function sdBody(fd: Field, x: number, y: number, z: number): number {
   let d = sdPalm(fd, x, y, z);
   for (const f of fd.digits) {
     const bound = Math.hypot(x - f.bc[0], y - f.bc[1], z - f.bc[2]) - f.br;
@@ -308,6 +351,20 @@ export function sdf(fd: Field, x: number, y: number, z: number): number {
   }
   for (const e of fd.nodules) {
     if (Math.hypot(x - e.c[0], y - e.c[1], z - e.c[2]) - e.rmax - 0.5 < d) d = smin(d, sdEllipsoid(e, x, y, z), 0.5);
+  }
+  return d;
+}
+
+export function sdf(fd: Field, x: number, y: number, z: number): number {
+  let d = sdBody(fd, x, y, z);
+  const w = fd.wound;
+  if (w) {
+    const cavity = woundCavity(w, x, y, z);
+    if (cavity < 0.4) {
+      // Carve the hollow with softly rounded edges, then lay the cord back in it.
+      d = -smin(-d, cavity, 0.1);
+      for (const c of w.cords) d = smin(d, sdCone(c, x, y, z), 0.12);
+    }
   }
   // Clean cut across the forearm, as on a display model, with a small bevel.
   const cut = fd.cutY - y;
@@ -324,6 +381,11 @@ const NAIL_EDGE: Vec3 = [0.97, 0.93, 0.89];
 const CREASE: Vec3 = [0.72, 0.52, 0.46];
 const CUT_FACE: Vec3 = [0.93, 0.9, 0.86];
 const BLANCH: Vec3 = [0.93, 0.83, 0.75];
+// Tissues in the wound, in the muted tones of an anatomical plate.
+const FAT: Vec3 = [0.95, 0.86, 0.68];
+const FASCIA: Vec3 = [0.9, 0.79, 0.73];
+const DERMIS: Vec3 = [0.86, 0.62, 0.58];
+const CORD: Vec3 = [0.93, 0.91, 0.86];
 
 function mix(a: Vec3, b: Vec3, t: number): Vec3 {
   return [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
@@ -489,6 +551,26 @@ export function surfaceAt(fd: Field, p: Vec3, n: Vec3): Surface {
   for (const cone of fd.cords) {
     const d = sdCone(cone, x, y, z);
     c = mix(c, BLANCH, 0.5 * (1 - smoothstep(0.05, 0.5, d)));
+  }
+
+  const w = fd.wound;
+  if (w) {
+    const inWound = 1 - smoothstep(0.0, 0.07, woundCavity(w, x, y, z));
+    if (inWound > 0) {
+      // Cut edge of the skin, then fat down the walls, fascia on the floor
+      // and the pearly cord lying in it.
+      const depth = -sdBody(fd, x, y, z);
+      let t = mix(FAT, FASCIA, smoothstep(w.floor + 0.25, w.floor + 0.05, z));
+      t = mix(t, DERMIS, smoothstep(0.2, 0.08, depth));
+      let cordD = Infinity;
+      for (const cone of w.cords) cordD = Math.min(cordD, sdCone(cone, x, y, z));
+      const onCord = 1 - smoothstep(0.02, 0.09, cordD);
+      t = mix(t, CORD, onCord);
+      c = mix(c, t, inWound);
+      gloss = Math.max(gloss, inWound * 0.06 * onCord);
+      // No skin creases or pores inside the wound.
+      if (inWound > 0.5) return { color: c, gloss, crease: [9, 0, 0, -1] };
+    }
   }
   return { color: c, gloss, crease };
 }

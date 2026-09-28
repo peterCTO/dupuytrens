@@ -11,6 +11,21 @@ Tubiana stage.
 
 ![Palmar aspect](docs/screenshots/palmar.png)
 
+**Theatre** mode operates on the finger: a fasciectomy through a Z-plasty.
+Mark the Z in violet, trace the incision with the scalpel, raise the flaps and
+hold them with skin hooks, click the cord to excise it (the finger then
+straightens), transpose the flaps and place the sutures.
+
+![Theatre: the cord exposed](docs/screenshots/theatre-cord.png)
+
+## Roadmap
+
+1. The model and the clinic: configure the contracture. *Done.*
+2. Theatre: fasciectomy with Z-plasty. *Done, first version.*
+3. Recovery: a physio stage with a hand specialist (hand therapist) after the
+   operation, covering splinting, scar care and exercises to keep the finger
+   straight.
+
 ## Running it
 
 ```sh
@@ -19,7 +34,8 @@ npm run dev      # http://localhost:5173
 npm run build    # static site in dist/
 ```
 
-Add `?view=ulnar` (or `palmar`, `radial`, `dorsal`) to open on a given aspect.
+Add `?view=ulnar` (or `palmar`, `radial`, `dorsal`) to open on a given aspect,
+or `?mode=theatre&step=excise` to jump to a step of the operation.
 
 ## How the hand is made
 
@@ -34,4 +50,7 @@ form naturally for any pose.
 - `src/hand/worker.ts`: runs the meshing off the main thread (about a second at full detail).
 - `src/hand/skin.ts`: bends the current mesh while a slider is dragged, so the
   finger follows the pointer; the exact mesh replaces it when the pointer settles.
-- `src/scene.ts`: lighting, material, plinth and camera.
+- `src/hand/surgery.ts`: the Z-plasty geometry and how the finger responds once released.
+- `src/scene.ts`: lighting, material, plinth and camera, plus the marks drawn on the skin.
+- `src/instruments.ts`: scalpel, skin hooks, sutures, and the nerves and arteries in the wound.
+- `src/theatre.ts`: the steps of the operation and the theatre panel.

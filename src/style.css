@@ -279,3 +279,117 @@ h2 {
   height: 16px;
   margin: 0;
 }
+
+body[data-mode='theatre'] .clinic-only,
+body:not([data-mode='theatre']) .theatre-only {
+  display: none;
+}
+
+.modes {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  overflow: hidden;
+}
+
+.modes button {
+  font: inherit;
+  font-size: 0.95rem;
+  letter-spacing: 0.04em;
+  background: none;
+  border: none;
+  padding: 6px 0;
+  color: var(--muted);
+  cursor: pointer;
+}
+
+.modes button + button {
+  border-left: 1px solid var(--rule);
+}
+
+.modes button.active {
+  background: #efe9e0;
+  color: var(--ink);
+}
+
+.op-finger {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 0 0 10px;
+}
+
+.op-finger button,
+.actions button {
+  font: inherit;
+  font-size: 0.9rem;
+  background: none;
+  border: 1px solid var(--rule);
+  border-radius: 3px;
+  padding: 5px 10px;
+  color: var(--ink);
+  cursor: pointer;
+}
+
+.op-finger button.active {
+  border-color: var(--ink);
+}
+
+.op-finger button:disabled,
+.actions button:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.actions button.primary {
+  border-color: var(--accent);
+  color: var(--accent);
+}
+
+.actions button.primary:hover:not(:disabled) {
+  background: #f7efec;
+}
+
+.steps {
+  margin: 4px 0 10px;
+  padding-left: 1.4em;
+  font-size: 0.95rem;
+  line-height: 1.55;
+  color: var(--muted);
+}
+
+.steps li.done {
+  color: var(--muted);
+  text-decoration: line-through;
+  text-decoration-color: var(--rule);
+}
+
+.steps li.current {
+  color: var(--ink);
+  font-weight: 600;
+}
+
+.instruction {
+  margin: 0 0 10px;
+  font-size: 0.95rem;
+  line-height: 1.45;
+}
+
+.progress {
+  height: 3px;
+  background: var(--rule);
+  margin: -2px 0 12px;
+}
+
+.progress span {
+  display: block;
+  height: 100%;
+  background: var(--accent);
+}

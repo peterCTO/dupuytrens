@@ -4,8 +4,10 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
-import { HandPose } from './hand/anatomy';
-import { CUT_Y, PALM_CREASES } from './hand/sdf';
+import { HandPose, Operation, WOUND_HALF_WIDTH, buildSkeleton } from './hand/anatomy';
+import { CUT_Y, PALM_CREASES, Field, buildField, sdf } from './hand/sdf';
+import type { P2, ZPlan } from './hand/surgery';
+import { makeBundles, makeHooks, makeScalpel, makeSutures, poseScalpel } from './instruments';
 import { skinMesh } from './hand/skin';
 import { MeshBuilder } from './hand/builder';
 import { growHair } from './hand/hair';
@@ -26,12 +28,27 @@ const VIEWS: Record<ViewName, THREE.Vector3> = {
 
 interface Bind {
   pose: HandPose;
+  op: Operation | null;
   positions: Float32Array;
   normals: Float32Array;
   weights: Float32Array;
 }
 
 const clonePose = (p: HandPose): HandPose => JSON.parse(JSON.stringify(p));
+
+/** What is drawn on the skin during an operation. */
+export interface SkinMarks {
+  /** The incision path, D-A-B-C. */
+  incision: P2[];
+  /** How much of it has been marked in violet, and how much cut, in cm. */
+  marked: number;
+  cut: number;
+  /** The closed Z, drawn once the flaps are transposed. */
+  scar: P2[] | null;
+}
+
+export type ToolName = 'scalpel' | 'forceps' | 'needle';
+export type PointerKind = 'down' | 'move' | 'up';
 
 export class HandView {
   onBusy: (busy: boolean) => void = () => {};
@@ -51,7 +68,28 @@ export class HandView {
   private inFlight = false;
   private queued: number | null = null;
   private remeshTimer = 0;
-  private flight: { from: THREE.Vector3; to: THREE.Vector3; t: number } | null = null;
+  private flight: { from: THREE.Vector3; to: THREE.Vector3; fromTarget: THREE.Vector3; toTarget: THREE.Vector3; t: number } | null = null;
+  private op: Operation | null = null;
+  /** The field of the mesh on screen, for finding where the pointer meets the skin. */
+  private pickField: Field | null = null;
+  private marks = {
+    uCut: { value: [0, 1, 2, 3].map(() => new THREE.Vector2()) },
+    uMarkLen: { value: 0 },
+    uCutLen: { value: 0 },
+    uScar: { value: [0, 1, 2, 3].map(() => new THREE.Vector2()) },
+    uScarOn: { value: 0 },
+  };
+  private surgical = new THREE.Group();
+  private hooks: THREE.Group | null = null;
+  private bundles: THREE.Group | null = null;
+  private sutures: THREE.Group | null = null;
+  private scalpel = makeScalpel();
+  private tool: ToolName | null = null;
+  private dragging = false;
+  /** Called with where the pointer meets the hand (in the hand's frame), when a tool is in use. */
+  onPointer: (kind: PointerKind, hit: THREE.Vector3 | null) => void = () => {};
+  /** Called whenever a new mesh has been built and is on screen. */
+  onMeshReady: () => void = () => {};
   private lastAspect: ViewName = 'palmar';
   private key = new THREE.DirectionalLight(0xfff4ea, 2.7);
   private fill = new THREE.DirectionalLight(0xeef2ff, 0.45);
@@ -77,7 +115,7 @@ export class HandView {
     this.controls.target.copy(TARGET);
     this.controls.enableDamping = true;
     this.controls.enablePan = false;
-    this.controls.minDistance = 14;
+    this.controls.minDistance = 9;
     this.controls.maxDistance = 110;
     this.controls.maxPolarAngle = Math.PI * 0.62;
     this.controls.addEventListener('start', () => (this.flight = null));
@@ -96,7 +134,7 @@ export class HandView {
       clearcoatRoughness: 0.5,
       envMapIntensity: 0.6,
     });
-    addSkinShading(this.material, this.backLight);
+    addSkinShading(this.material, this.backLight, this.marks);
     this.hand = new THREE.Mesh(new THREE.BufferGeometry(), this.material);
     this.hand.castShadow = true;
     this.hand.receiveShadow = true;
@@ -105,7 +143,10 @@ export class HandView {
     const hairMaterial = new THREE.LineBasicMaterial({ color: 0x6a5242, transparent: true, opacity: 0.36, depthWrite: false });
     this.hairFixed = new THREE.LineSegments(new THREE.BufferGeometry(), hairMaterial);
     this.hairFingers = new THREE.LineSegments(new THREE.BufferGeometry(), hairMaterial);
-    this.hand.add(this.hairFixed, this.hairFingers);
+    this.hand.add(this.hairFixed, this.hairFingers, this.surgical);
+    this.scalpel.visible = false;
+    this.hand.add(this.scalpel);
+    this.setupPointer();
 
     this.request(DRAFT);
     this.request(FINE);
@@ -182,13 +223,129 @@ export class HandView {
   goTo(name: ViewName, instant = false) {
     const offset = VIEWS[name].clone();
     const to = TARGET.clone().add(offset.sub(TARGET).setLength(this.camera.position.distanceTo(this.controls.target)));
+    this.fly(TARGET.clone(), to, instant);
+  }
+
+  /** Look at a point on the hand (its own frame) from a direction and distance. */
+  focus(at: THREE.Vector3, dir: THREE.Vector3, distance: number, instant = false) {
+    const target = at.clone().add(this.hand.position);
+    this.fly(target, target.clone().add(dir.clone().normalize().multiplyScalar(distance)), instant);
+  }
+
+  private fly(target: THREE.Vector3, to: THREE.Vector3, instant: boolean) {
     if (instant) {
+      this.controls.target.copy(target);
       this.camera.position.copy(to);
       this.controls.update();
       this.onAspect();
     } else {
-      this.flight = { from: this.camera.position.clone(), to, t: 0 };
+      this.flight = { from: this.camera.position.clone(), to, fromTarget: this.controls.target.clone(), toTarget: target, t: 0 };
     }
+  }
+
+  /** The operation shaping the model (wound, cords removed), or null. */
+  setOperation(op: Operation | null) {
+    this.op = op ? { ...op } : null;
+    window.clearTimeout(this.remeshTimer);
+    this.request(FINE);
+  }
+
+  setMarks(m: SkinMarks | null) {
+    const u = this.marks;
+    u.uMarkLen.value = m ? m.marked : 0;
+    u.uCutLen.value = m ? m.cut : 0;
+    u.uScarOn.value = m?.scar ? 1 : 0;
+    if (m) m.incision.forEach((p, i) => u.uCut.value[i].set(p[0], p[1]));
+    if (m?.scar) m.scar.forEach((p, i) => u.uScar.value[i].set(p[0], p[1]));
+  }
+
+  /** Skin hooks and the nerves and arteries in the open wound. */
+  setWoundDetail(plan: ZPlan | null) {
+    for (const g of [this.hooks, this.bundles]) if (g) this.surgical.remove(g);
+    this.hooks = this.bundles = null;
+    if (!plan) return;
+    this.hooks = makeHooks(plan, WOUND_HALF_WIDTH, (x, y) => this.surfaceZ(x, y));
+    this.bundles = makeBundles(plan, buildSkeleton(this.pose, this.op).wound?.floor ?? 0.87);
+    this.surgical.add(this.hooks, this.bundles);
+  }
+
+  setSutures(stitches: { at: P2; dir: P2 }[]) {
+    if (this.sutures) this.surgical.remove(this.sutures);
+    this.sutures = stitches.length ? makeSutures(stitches, (x, y) => this.surfaceZ(x, y)) : null;
+    if (this.sutures) this.surgical.add(this.sutures);
+  }
+
+  setTool(tool: ToolName | null) {
+    this.tool = tool;
+    this.renderer.domElement.style.cursor = tool === 'scalpel' ? 'none' : tool ? 'pointer' : '';
+    if (tool !== 'scalpel') this.scalpel.visible = false;
+  }
+
+  /** Show the scalpel with its tip at a point on the skin, travelling along cutDir. */
+  showScalpel(at: THREE.Vector3 | null, cutDir: P2) {
+    this.scalpel.visible = at !== null && this.tool === 'scalpel';
+    if (at) poseScalpel(this.scalpel, at, cutDir);
+  }
+
+  /** Height of the palm's surface above (x, y), found by marching down from above. */
+  surfaceZ(x: number, y: number): number {
+    const hit = this.march(new THREE.Vector3(x, y, 6), new THREE.Vector3(0, 0, -1));
+    return hit ? hit.z : 1.5;
+  }
+
+  /** Sphere-trace a ray (hand frame) against the model's field. */
+  private march(o: THREE.Vector3, d: THREE.Vector3): THREE.Vector3 | null {
+    const fd = this.pickField;
+    if (!fd) return null;
+    let t = 0;
+    for (let i = 0; i < 256 && t < 400; i++) {
+      const x = o.x + d.x * t, y = o.y + d.y * t, z = o.z + d.z * t;
+      const dist = sdf(fd, x, y, z);
+      if (dist < 0.002) return new THREE.Vector3(x, y, z);
+      t += Math.max(dist * 0.8, 0.002);
+    }
+    return null;
+  }
+
+  private pick(e: PointerEvent): THREE.Vector3 | null {
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    const ndc = new THREE.Vector2(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
+    const ray = new THREE.Raycaster();
+    ray.setFromCamera(ndc, this.camera);
+    const o = ray.ray.origin.clone().sub(this.hand.position);
+    return this.march(o, ray.ray.direction);
+  }
+
+  private setupPointer() {
+    const el = this.renderer.domElement;
+    el.addEventListener('pointerdown', (e) => {
+      if (!this.tool) return;
+      const hit = this.pick(e);
+      if (!hit) return;
+      // Work on the skin rather than turning the model.
+      this.dragging = true;
+      this.controls.enabled = false;
+      el.setPointerCapture(e.pointerId);
+      this.onPointer('down', hit);
+    });
+    el.addEventListener('pointermove', (e) => {
+      if (!this.tool) return;
+      this.onPointer('move', this.pick(e));
+    });
+    const end = (e: PointerEvent) => {
+      if (!this.dragging) return;
+      this.dragging = false;
+      this.controls.enabled = true;
+      this.onPointer('up', this.pick(e));
+    };
+    el.addEventListener('pointerup', end);
+    el.addEventListener('pointercancel', end);
+    el.addEventListener('pointerleave', () => this.tool === 'scalpel' && !this.dragging && (this.scalpel.visible = false));
+  }
+
+  /** Whether the pointer is pressed on the skin with a tool. */
+  get pressing(): boolean {
+    return this.dragging;
   }
 
   /** Move the camera closer (factor < 1) or further away along its current line. */
@@ -219,13 +376,16 @@ export class HandView {
     delete document.body.dataset.ready;
     this.onBusy(true);
     const pose = clonePose(this.pose);
-    this.builder.build(pose, h).then((mesh) => this.receive({ pose, mesh, h }));
+    const op = this.op ? { ...this.op } : null;
+    this.builder.build(pose, op, h).then((mesh) => this.receive({ pose, op, mesh, h }));
   }
 
-  private receive(msg: { pose: HandPose; mesh: MeshData; h: number }) {
+  private receive(msg: { pose: HandPose; op: Operation | null; mesh: MeshData; h: number }) {
     const { mesh } = msg;
+    this.pickField = buildField(buildSkeleton(msg.pose, msg.op));
     this.bind = {
       pose: msg.pose,
+      op: msg.op,
       positions: mesh.positions,
       normals: mesh.normals,
       weights: mesh.weights,
@@ -263,6 +423,7 @@ export class HandView {
       this.onBusy(false);
       document.body.dataset.ready = 'true';
     }
+    this.onMeshReady();
   }
 
   private applySkin() {
@@ -301,10 +462,12 @@ export class HandView {
       f.t = Math.min(1, f.t + 0.035);
       const e = f.t < 0.5 ? 2 * f.t * f.t : 1 - (-2 * f.t + 2) ** 2 / 2;
       // Swing around the model rather than cutting through it.
-      const r = THREE.MathUtils.lerp(f.from.distanceTo(TARGET), f.to.distanceTo(TARGET), e);
-      const dir = f.from.clone().sub(TARGET).normalize().lerp(f.to.clone().sub(TARGET).normalize(), e);
+      const target = f.fromTarget.clone().lerp(f.toTarget, e);
+      const r = THREE.MathUtils.lerp(f.from.distanceTo(f.fromTarget), f.to.distanceTo(f.toTarget), e);
+      const dir = f.from.clone().sub(f.fromTarget).normalize().lerp(f.to.clone().sub(f.toTarget).normalize(), e);
       if (dir.lengthSq() < 1e-4) dir.set(1, 0, 0);
-      this.camera.position.copy(TARGET).add(dir.setLength(r));
+      this.controls.target.copy(target);
+      this.camera.position.copy(target).add(dir.setLength(r));
       if (f.t >= 1) this.flight = null;
     }
     this.controls.update();
@@ -327,9 +490,10 @@ export class HandView {
  * - soft darkening in creases and between fingers (ambient occlusion baked per vertex);
  * - warm light scattering through thin flesh, strongest when backlit.
  */
-function addSkinShading(material: THREE.MeshPhysicalMaterial, backLight: { value: THREE.Vector3 }) {
+function addSkinShading(material: THREE.MeshPhysicalMaterial, backLight: { value: THREE.Vector3 }, marks: Record<string, { value: unknown }>) {
   material.onBeforeCompile = (shader) => {
     shader.uniforms.uBackLight = backLight;
+    Object.assign(shader.uniforms, marks);
     shader.uniforms.uPalmCreases = { value: PALM_SEGMENTS };
     shader.vertexShader = shader.vertexShader
       .replace(
@@ -358,7 +522,8 @@ function addSkinShading(material: THREE.MeshPhysicalMaterial, backLight: { value
         float skinHeight = 0.0;
         float skinDark = 0.0;
         skinDetail(skinHeight, skinDark);
-        diffuseColor.rgb *= mix(vec3(1.0), vec3(0.78, 0.6, 0.55), skinDark);`,
+        diffuseColor.rgb *= mix(vec3(1.0), vec3(0.78, 0.6, 0.55), skinDark);
+        surgeryMarks(diffuseColor.rgb, skinHeight);`,
       )
       .replace(
         '#include <roughnessmap_fragment>',
@@ -386,16 +551,22 @@ function addSkinShading(material: THREE.MeshPhysicalMaterial, backLight: { value
         '#include <lights_fragment_end>',
         `#include <lights_fragment_end>
         {
-          float ao = vShading.y;
+          // The open wound is lit by the theatre lamp, so don't let it sink into darkness.
+          float ao = mix(max(vShading.y, 0.75), vShading.y, step(-0.5, vCrease.w));
           reflectedLight.indirectDiffuse *= ao;
           reflectedLight.indirectSpecular *= ao;
           reflectedLight.directDiffuse *= mix(0.55, 1.0, ao);
           reflectedLight.directSpecular *= mix(0.4, 1.0, ao);
+          // The theatre lamp shines straight into an open wound, filling its shadows.
+          float wound = 1.0 - step(-0.5, vCrease.w);
+          reflectedLight.indirectDiffuse += diffuseColor.rgb * 0.55 * wound;
+          reflectedLight.indirectSpecular *= 1.0 - 0.6 * wound;
 
-          float thin = exp(-vShading.z * 0.9);
+          // Tissue inside a wound is lit plainly, without the glow of light through skin.
+          float thin = exp(-vShading.z * 0.9) * step(-0.5, vCrease.w);
           vec3 blood = vec3(0.95, 0.32, 0.2);
           // Light scattered inside the flesh fills the shadow side with warmth.
-          reflectedLight.indirectDiffuse += diffuseColor.rgb * blood * (0.1 + 0.35 * thin) * ao;
+          reflectedLight.indirectDiffuse += diffuseColor.rgb * blood * (0.1 + 0.35 * thin) * ao * mix(0.3, 1.0, step(-0.5, vCrease.w));
           // Backlit thin parts (finger edges, webs) glow.
           vec3 L = normalize(mat3(viewMatrix) * uBackLight);
           float behind = pow(clamp(dot(-geometryViewDir, L), 0.0, 1.0), 2.0);
@@ -419,6 +590,11 @@ varying vec3 vShading;
 varying vec4 vCrease;
 varying vec3 vObjPos;
 varying vec3 vObjNormal;
+uniform vec2 uCut[4];
+uniform float uMarkLen;
+uniform float uCutLen;
+uniform vec2 uScar[4];
+uniform float uScarOn;
 
 float skinHash(vec3 p) {
   p = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3));
@@ -570,6 +746,63 @@ void skinDetail(out float height, out float dark) {
     float f = (palmLines * palmSide + diamonds * backSide) * body;
     dark = max(dark, f * 0.45);
     height -= f * 0.008;
+  }
+  // Inside a wound there is no skin to crease.
+  float skin = step(-0.5, vCrease.w);
+  dark *= skin;
+  height *= skin;
+}
+
+// Distance from p to a three-limbed path, and how far along the path the nearest point lies.
+float pathDist(vec2 p, vec2 q0, vec2 q1, vec2 q2, vec2 q3, out float s) {
+  vec2 pts[4] = vec2[4](q0, q1, q2, q3);
+  float best = 99.0;
+  float base = 0.0;
+  s = 0.0;
+  for (int i = 0; i < 3; i++) {
+    vec2 a = pts[i];
+    vec2 ab = pts[i + 1] - a;
+    float l = length(ab);
+    float t = clamp(dot(p - a, ab) / (l * l), 0.0, 1.0);
+    float d = length(p - a - ab * t);
+    if (d < best) { best = d; s = base + t * l; }
+    base += l;
+  }
+  return best;
+}
+
+// Surgical marker, the incision and the closed scar, drawn on the palm.
+void surgeryMarks(inout vec3 col, inout float height) {
+  if (uMarkLen <= 0.0 && uCutLen <= 0.0 && uScarOn <= 0.0) return;
+  float facing = smoothstep(0.15, 0.45, vObjNormal.z) * step(-0.5, vCrease.w);
+  if (facing <= 0.0) return;
+  vec2 p = vObjPos.xy;
+  float s;
+  float d = pathDist(p, uCut[0], uCut[1], uCut[2], uCut[3], s);
+  if (s < uMarkLen) {
+    // Gentian violet from a skin marker: a soft line with a little ink variation.
+    float w = max(0.03, fwidth(d) * 1.5);
+    float ink = (1.0 - smoothstep(w * 0.45, w, d)) * (0.7 + 0.3 * skinNoise(vObjPos * 30.0));
+    col = mix(col, vec3(0.34, 0.18, 0.5), ink * 0.8 * facing);
+  }
+  if (s < uCutLen) {
+    // A clean incision: a fine dark line with a sliver of cut edge either side.
+    float w = max(0.012, fwidth(d) * 1.2);
+    float cut = 1.0 - smoothstep(w * 0.5, w, d);
+    float lip = (1.0 - smoothstep(w, w * 3.0, d)) * 0.35;
+    col = mix(col, vec3(0.78, 0.45, 0.42), lip * facing);
+    col = mix(col, vec3(0.36, 0.08, 0.08), cut * facing);
+    height -= (cut * 0.012 + lip * 0.004) * facing;
+  }
+  if (uScarOn > 0.0) {
+    float t;
+    float ds = pathDist(p, uScar[0], uScar[1], uScar[2], uScar[3], t);
+    float w = max(0.014, fwidth(ds) * 1.2);
+    float line = 1.0 - smoothstep(w * 0.5, w, ds);
+    float flush = (1.0 - smoothstep(w, 0.09, ds)) * 0.4;
+    col = mix(col, vec3(0.86, 0.55, 0.5), flush * facing);
+    col = mix(col, vec3(0.5, 0.18, 0.17), line * facing);
+    height -= line * 0.008 * facing;
   }
 }
 `;
