@@ -67,11 +67,12 @@ export class MeshBuilder {
       normals: new Float32Array(count * 3),
       colors: new Float32Array(count * 3),
       shading: new Float32Array(count * 3),
+      creases: new Float32Array(count * 4),
       weights: new Float32Array(count * 16),
     };
     chunks.forEach(([a], i) => {
       for (const key of Object.keys(out) as (keyof VertexData)[]) {
-        const per = key === 'weights' ? 16 : 3;
+        const per = key === 'weights' ? 16 : key === 'creases' ? 4 : 3;
         out[key].set(shaded[i][key] as Float32Array, a * per);
       }
     });

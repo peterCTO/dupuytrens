@@ -24,6 +24,6 @@ self.onmessage = (e: MessageEvent<Job>) => {
     post({ id: job.id, ...s }, [s.positions.buffer, s.indices.buffer]);
   } else {
     const v = shadeVertices(sk, fd, job.positions);
-    post({ id: job.id, ...v }, [v.positions.buffer, v.normals.buffer, v.colors.buffer, v.shading.buffer, v.weights.buffer]);
+    post({ id: job.id, ...v }, [v.positions.buffer, v.normals.buffer, v.colors.buffer, v.shading.buffer, v.creases.buffer, v.weights.buffer]);
   }
 };

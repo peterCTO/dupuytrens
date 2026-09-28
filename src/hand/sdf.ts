@@ -342,7 +342,7 @@ function distToPolyline(pts: [number, number][], x: number, y: number): number {
 }
 
 // The three principal palmar creases, in the palm plane.
-const PALM_CREASES: [number, number][][] = [
+export const PALM_CREASES: [number, number][][] = [
   // Distal transverse ("heart line").
   [[-4.0, 7.35], [-2.4, 7.55], [-0.6, 7.95], [0.9, 8.5], [1.7, 9.0]],
   // Proximal transverse ("head line").
@@ -352,6 +352,10 @@ const PALM_CREASES: [number, number][][] = [
   // Wrist creases.
   [[-2.3, 0.25], [0, 0.05], [2.4, 0.3]],
   [[-2.2, -0.45], [0, -0.6], [2.3, -0.4]],
+  // Minor creases: a faint longitudinal line and short hypothenar lines.
+  [[-0.2, 1.4], [-0.5, 3.6], [-0.7, 5.6]],
+  [[-3.9, 5.2], [-3.1, 5.0]],
+  [[-3.9, 4.4], [-3.0, 4.35]],
 ];
 
 // Smooth value noise, for the uneven tone of real skin.
@@ -387,11 +391,19 @@ export interface Surface {
   color: Vec3;
   /** 0 for skin, 1 for the polished nail plate. */
   gloss: number;
+  /**
+   * Coordinates the shader uses to draw fine creases on the digits:
+   * [signed distance along the digit to the nearest crease site (cm),
+   *  how much the point is on a digit (0..1),
+   *  facing: +1 palmar, -1 dorsal,
+   *  which site: 0 palmodigital, 0.5 PIP (or thumb MCP), 1 DIP (or thumb IP)].
+   */
+  crease: [number, number, number, number];
 }
 
 export function surfaceAt(fd: Field, p: Vec3, n: Vec3): Surface {
   const [x, y, z] = p;
-  if (y < fd.cutY + 0.02 && n[1] < -0.8) return { color: CUT_FACE, gloss: 0 };
+  if (y < fd.cutY + 0.02 && n[1] < -0.8) return { color: CUT_FACE, gloss: 0, crease: [9, 0, 0, 0] };
   let gloss = 0;
 
   // Palmar skin is paler than dorsal skin.
@@ -412,6 +424,31 @@ export function surfaceAt(fd: Field, p: Vec3, n: Vec3): Surface {
     }
   }
   const onDigit = digit !== null && best < 0.35;
+  const crease: [number, number, number, number] = [9, 0, 0, 0];
+  if (digit) {
+    const segs = digit.segments;
+    const sites: { at: Vec3; dir: Vec3 }[] = [
+      { at: [0, 1, 2].map((k) => segs[0].a[k] + segs[0].axis[k] * (digit.isThumb ? 0 : 1.55)) as Vec3, dir: segs[0].axis },
+      { at: segs[1].a, dir: norm([0, 1, 2].map((k) => segs[0].axis[k] + segs[1].axis[k]) as Vec3) },
+      { at: segs[2].a, dir: norm([0, 1, 2].map((k) => segs[1].axis[k] + segs[2].axis[k]) as Vec3) },
+    ];
+    let site = 0;
+    let t = Infinity;
+    sites.forEach((st, k) => {
+      const u = (x - st.at[0]) * st.dir[0] + (y - st.at[1]) * st.dir[1] + (z - st.at[2]) * st.dir[2];
+      if (Math.abs(u) < Math.abs(t)) {
+        t = u;
+        site = k;
+      }
+    });
+    const seg = segs[site === 0 ? 0 : site - (t < 0 ? 1 : 0)];
+    crease[0] = t;
+    crease[1] = 1 - smoothstep(0.15, 0.45, best);
+    crease[2] = dot(n, seg.palmar);
+    crease[3] = site / 2;
+    // The thumb's first site is its CMC joint, buried in the thenar eminence.
+    if (digit.isThumb && site === 0) crease[1] = 0;
+  }
 
   if (onDigit && digit) {
     const segs = digit.segments;
@@ -425,29 +462,6 @@ export function surfaceAt(fd: Field, p: Vec3, n: Vec3): Surface {
       const dj = Math.hypot(x - j[0], y - j[1], z - j[2]);
       c = mix(c, FLUSH, 0.35 * smoothstep(0.3, 0.9, back) * (1 - smoothstep(0.6, 1.1, dj)));
     }
-    // Flexion creases on the palmar side of each joint.
-    for (let i = 0; i < 3; i++) {
-      const s = segs[i];
-      const facing = smoothstep(0.35, 0.8, dot(n, s.palmar));
-      if (facing <= 0) continue;
-      const u = (x - s.a[0]) * s.axis[0] + (y - s.a[1]) * s.axis[1] + (z - s.a[2]) * s.axis[2];
-      const offsets = digit.isThumb ? (i === 2 ? [0] : []) : i === 0 ? [1.55] : [-0.08, 0.12];
-      for (const o of offsets) {
-        const g = Math.exp(-(((u - o) / 0.075) ** 2));
-        c = mix(c, CREASE, 0.3 * g * facing);
-      }
-    }
-    // Fine transverse wrinkles over the back of the PIP and DIP joints.
-    for (let i = 1; i < 3; i++) {
-      const s = segs[i];
-      const back = smoothstep(0.4, 0.85, -dot(n, s.palmar));
-      if (back <= 0) continue;
-      const u = (x - s.a[0]) * s.axis[0] + (y - s.a[1]) * s.axis[1] + (z - s.a[2]) * s.axis[2];
-      const span = i === 1 ? 0.45 : 0.3;
-      if (Math.abs(u) > span) continue;
-      const lines = 0.5 + 0.5 * Math.cos((u / span) * Math.PI * (i === 1 ? 4 : 3));
-      c = mix(c, CREASE, 0.14 * back * lines * (1 - Math.abs(u) / span));
-    }
     const nail = nailCoords(digit, x, y, z);
     if (nail.mask > 0) {
       c = mix(c, NAIL, nail.mask);
@@ -459,7 +473,7 @@ export function surfaceAt(fd: Field, p: Vec3, n: Vec3): Surface {
     if (facing > 0) {
       for (const line of PALM_CREASES) {
         const d = distToPolyline(line, x, y);
-        c = mix(c, CREASE, 0.26 * Math.exp(-((d / 0.075) ** 2)) * facing);
+        c = mix(c, CREASE, 0.12 * Math.exp(-((d / 0.12) ** 2)) * facing);
       }
     }
     const back = smoothstep(0.2, 0.7, -n[2]) * (1 - smoothstep(-0.6, -0.2, z)) * (1 - smoothstep(7.4, 8.4, y));
@@ -476,7 +490,7 @@ export function surfaceAt(fd: Field, p: Vec3, n: Vec3): Surface {
     const d = sdCone(cone, x, y, z);
     c = mix(c, BLANCH, 0.5 * (1 - smoothstep(0.05, 0.5, d)));
   }
-  return { color: c, gloss };
+  return { color: c, gloss, crease };
 }
 
 /**

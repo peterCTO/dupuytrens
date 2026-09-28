@@ -13,6 +13,8 @@ export interface MeshData {
   colors: Float32Array;
   /** Per vertex: nail gloss, ambient occlusion, flesh thickness. */
   shading: Float32Array;
+  /** Per vertex: crease coordinates, see Surface.crease. */
+  creases: Float32Array;
   indices: Uint32Array;
   /**
    * Skinning weights, 16 per vertex: for each of the four fingers,
@@ -196,6 +198,7 @@ export function shadeVertices(sk: Skeleton, fd: Field, rough: Float32Array): Ver
   const colors = new Float32Array(count * 3);
   const weights = new Float32Array(count * 16);
   const shading = new Float32Array(count * 3);
+  const creases = new Float32Array(count * 4);
   for (let n = 0; n < count; n++) {
     let p: [number, number, number] = [rough[3 * n], rough[3 * n + 1], rough[3 * n + 2]];
     const d = sdf(fd, p[0], p[1], p[2]);
@@ -206,11 +209,12 @@ export function shadeVertices(sk: Skeleton, fd: Field, rough: Float32Array): Ver
     normals.set(nrm, 3 * n);
     colors.set(surface.color, 3 * n);
     shading[3 * n] = surface.gloss;
+    creases.set(surface.crease, 4 * n);
     shading[3 * n + 1] = occlusionAt(fd, p, nrm);
     shading[3 * n + 2] = thicknessAt(fd, p, nrm);
     skinWeights(sk, fd, p, weights, 16 * n);
   }
-  return { positions, normals, colors, shading, weights };
+  return { positions, normals, colors, shading, creases, weights };
 }
 
 /** Builds the whole mesh on one thread. */
