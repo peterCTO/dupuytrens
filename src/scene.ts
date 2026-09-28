@@ -7,7 +7,7 @@ import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment
 import { HandPose } from './hand/anatomy';
 import { CUT_Y } from './hand/sdf';
 import { skinMesh } from './hand/skin';
-import type { MeshRequest } from './hand/worker';
+import { MeshBuilder } from './hand/builder';
 import type { MeshData } from './hand/mesher';
 
 export type ViewName = 'palmar' | 'dorsal' | 'ulnar' | 'radial';
@@ -42,15 +42,19 @@ export class HandView {
   private controls: OrbitControls;
   private hand: THREE.Mesh;
   private material: THREE.MeshPhysicalMaterial;
-  private worker: Worker;
+  private builder = new MeshBuilder();
   private pose: HandPose;
   private bind: Bind | null = null;
   private inFlight = false;
-  private queued: MeshRequest | null = null;
-  private nextId = 1;
+  private queued: number | null = null;
   private remeshTimer = 0;
   private flight: { from: THREE.Vector3; to: THREE.Vector3; t: number } | null = null;
   private lastAspect: ViewName = 'palmar';
+  private key = new THREE.DirectionalLight(0xfff4ea, 2.7);
+  private fill = new THREE.DirectionalLight(0xeef2ff, 0.45);
+  private rim = new THREE.DirectionalLight(0xfff6ee, 1.5);
+  /** World direction towards the rim light, for light bleeding through thin flesh. */
+  private backLight = { value: new THREE.Vector3(0, 0, -1) };
 
   constructor(private host: HTMLElement, pose: HandPose) {
     this.pose = clonePose(pose);
@@ -61,7 +65,7 @@ export class HandView {
     this.renderer.toneMapping = THREE.NeutralToneMapping;
     this.renderer.toneMappingExposure = 1.0;
     this.renderer.shadowMap.enabled = true;
-    this.renderer.shadowMap.type = THREE.PCFSoftShadowMap;
+    this.renderer.shadowMap.type = THREE.PCFShadowMap;
     host.append(this.renderer.domElement);
 
     this.camera = new THREE.PerspectiveCamera(26, 1, 1, 400);
@@ -80,24 +84,21 @@ export class HandView {
 
     this.material = new THREE.MeshPhysicalMaterial({
       vertexColors: true,
-      roughness: 0.58,
+      roughness: 0.6,
       metalness: 0,
-      sheen: 0.6,
-      sheenRoughness: 0.45,
+      sheen: 0.5,
+      sheenRoughness: 0.5,
       sheenColor: new THREE.Color(0xffd6c4),
-      clearcoat: 0.12,
-      clearcoatRoughness: 0.55,
-      envMapIntensity: 0.55,
+      clearcoat: 0.1,
+      clearcoatRoughness: 0.5,
+      envMapIntensity: 0.6,
     });
-    addWaxTranslucency(this.material);
+    addSkinShading(this.material, this.backLight);
     this.hand = new THREE.Mesh(new THREE.BufferGeometry(), this.material);
     this.hand.castShadow = true;
     this.hand.receiveShadow = true;
     this.hand.position.y = -CUT_Y;
     this.scene.add(this.hand);
-
-    this.worker = new Worker(new URL('./hand/worker.ts', import.meta.url), { type: 'module' });
-    this.worker.onmessage = (e) => this.receive(e.data);
 
     this.request(DRAFT);
     this.request(FINE);
@@ -114,10 +115,12 @@ export class HandView {
 
     this.scene.add(new THREE.HemisphereLight(0xffffff, 0xe9e2d8, 0.3));
 
-    const key = new THREE.DirectionalLight(0xfff4ea, 2.6);
-    key.position.set(-20, 26, 18);
+    // The lights ride with the camera, like a photographer's studio rig, so
+    // the model is modelled by raking light from whichever side it is seen.
+    const key = this.key;
     key.castShadow = true;
     key.shadow.mapSize.set(2048, 2048);
+    key.shadow.radius = 5;
     key.shadow.bias = -0.0005;
     key.shadow.normalBias = 0.02;
     const s = key.shadow.camera;
@@ -125,13 +128,23 @@ export class HandView {
     key.target.position.copy(TARGET);
     this.scene.add(key, key.target);
 
-    const fill = new THREE.DirectionalLight(0xeef2ff, 0.4);
-    fill.position.set(22, 8, 14);
-    this.scene.add(fill);
+    this.scene.add(this.fill, this.rim);
+    this.fill.target.position.copy(TARGET);
+    this.rim.target.position.copy(TARGET);
+    this.scene.add(this.fill.target, this.rim.target);
+  }
 
-    const rim = new THREE.DirectionalLight(0xfff6ee, 1.9);
-    rim.position.set(6, 18, -26);
-    this.scene.add(rim);
+  /** Place the lights relative to the camera: key high left, fill low right, rim behind. */
+  private placeLights() {
+    const back = this.camera.position.clone().sub(TARGET).normalize();
+    const right = new THREE.Vector3().crossVectors(this.camera.up, back).normalize();
+    const up = new THREE.Vector3().crossVectors(back, right);
+    const at = (r: number, u: number, b: number, dist: number) =>
+      TARGET.clone().add(right.clone().multiplyScalar(r).add(up.clone().multiplyScalar(u)).add(back.clone().multiplyScalar(b)).normalize().multiplyScalar(dist));
+    this.key.position.copy(at(-0.75, 0.8, 0.55, 40));
+    this.fill.position.copy(at(0.9, -0.1, 0.5, 40));
+    this.rim.position.copy(at(0.45, 0.6, -0.9, 40));
+    this.backLight.value.copy(this.rim.position).sub(TARGET).normalize();
   }
 
   private setupStage() {
@@ -171,6 +184,13 @@ export class HandView {
     }
   }
 
+  /** Move the camera closer (factor < 1) or further away along its current line. */
+  zoom(factor: number) {
+    const d = this.camera.position.clone().sub(this.controls.target).multiplyScalar(factor);
+    this.camera.position.copy(this.controls.target).add(d);
+    this.controls.update();
+  }
+
   /** Which face of the hand the camera is looking at. */
   aspect(): ViewName {
     const d = this.camera.position.clone().sub(this.controls.target);
@@ -179,20 +199,20 @@ export class HandView {
   }
 
   private request(h: number) {
-    const req: MeshRequest = { id: this.nextId++, pose: clonePose(this.pose), h };
     if (this.inFlight) {
-      // Only the latest fine request matters; a queued draft is superseded.
-      this.queued = req;
+      // Only the latest request matters; it runs with whatever the pose is then.
+      this.queued = h;
       return;
     }
-    this.send(req);
+    this.send(h);
   }
 
-  private send(req: MeshRequest) {
+  private send(h: number) {
     this.inFlight = true;
     delete document.body.dataset.ready;
     this.onBusy(true);
-    this.worker.postMessage(req);
+    const pose = clonePose(this.pose);
+    this.builder.build(pose, h).then((mesh) => this.receive({ pose, mesh }));
   }
 
   private receive(msg: { pose: HandPose; mesh: MeshData }) {
@@ -210,6 +230,7 @@ export class HandView {
     const colors = mesh.colors;
     for (let i = 0; i < colors.length; i++) colors[i] = srgbToLinear(colors[i]);
     g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    g.setAttribute('shading', new THREE.BufferAttribute(mesh.shading, 3));
     g.setIndex(new THREE.BufferAttribute(mesh.indices, 1));
     g.computeBoundingSphere();
     this.hand.geometry.dispose();
@@ -218,10 +239,9 @@ export class HandView {
     this.applySkin();
 
     this.inFlight = false;
-    if (this.queued) {
+    if (this.queued !== null) {
       const next = this.queued;
       this.queued = null;
-      next.pose = clonePose(this.pose);
       this.send(next);
     } else {
       this.onBusy(false);
@@ -270,6 +290,7 @@ export class HandView {
       if (f.t >= 1) this.flight = null;
     }
     this.controls.update();
+    this.placeLights();
     const aspect = this.aspect();
     if (aspect !== this.lastAspect) {
       this.lastAspect = aspect;
@@ -280,19 +301,97 @@ export class HandView {
 }
 
 /**
- * Softens the terminator and lets a little warm light bleed into the shadow
- * side, the way wax or a painted resin model scatters light.
+ * Skin details that a plain physical material lacks:
+ * - fine pores and wrinkles, as a procedural bump on the surface normal;
+ * - glossy nails against matte skin;
+ * - soft darkening in creases and between fingers (ambient occlusion baked per vertex);
+ * - warm light scattering through thin flesh, strongest when backlit, as in real
+ *   fingers or a cast in translucent resin.
  */
-function addWaxTranslucency(material: THREE.MeshPhysicalMaterial) {
+function addSkinShading(material: THREE.MeshPhysicalMaterial, backLight: { value: THREE.Vector3 }) {
   material.onBeforeCompile = (shader) => {
-    shader.fragmentShader = shader.fragmentShader.replace(
-      '#include <lights_fragment_end>',
-      `#include <lights_fragment_end>
-      {
-        float wrap = 0.5 + 0.5 * dot(normal, normalize(vec3(-0.35, 0.8, 0.5)));
-        reflectedLight.indirectDiffuse += diffuseColor.rgb * vec3(0.26, 0.11, 0.07) * (1.0 - wrap * 0.6);
-      }`,
-    );
+    shader.uniforms.uBackLight = backLight;
+    shader.vertexShader = shader.vertexShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+        attribute vec3 shading;
+        varying vec3 vShading;
+        varying vec3 vObjPos;`,
+      )
+      .replace(
+        '#include <begin_vertex>',
+        `#include <begin_vertex>
+        vShading = shading;
+        vObjPos = position;`,
+      );
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+        uniform vec3 uBackLight;
+        varying vec3 vShading;
+        varying vec3 vObjPos;
+        float skinHash(vec3 p) {
+          p = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3));
+          p *= 17.0;
+          return fract(p.x * p.y * p.z * (p.x + p.y + p.z));
+        }
+        float skinNoise(vec3 x) {
+          vec3 i = floor(x);
+          vec3 f = fract(x);
+          f = f * f * (3.0 - 2.0 * f);
+          return mix(mix(mix(skinHash(i), skinHash(i + vec3(1, 0, 0)), f.x),
+                         mix(skinHash(i + vec3(0, 1, 0)), skinHash(i + vec3(1, 1, 0)), f.x), f.y),
+                     mix(mix(skinHash(i + vec3(0, 0, 1)), skinHash(i + vec3(1, 0, 1)), f.x),
+                         mix(skinHash(i + vec3(0, 1, 1)), skinHash(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+        }
+        float skinBump(vec3 p) {
+          return skinNoise(p * 14.0) * 0.55 + skinNoise(p * 31.0) * 0.3 + skinNoise(p * 4.5) * 0.4;
+        }`,
+      )
+      .replace(
+        '#include <roughnessmap_fragment>',
+        `#include <roughnessmap_fragment>
+        float pore = skinNoise(vObjPos * 22.0);
+        roughnessFactor = mix(roughnessFactor + (pore - 0.5) * 0.12, 0.18, vShading.x);`,
+      )
+      .replace(
+        '#include <normal_fragment_maps>',
+        `#include <normal_fragment_maps>
+        {
+          // Bump the normal with the gradient of the pore noise (object space is
+          // world space here: the hand is only translated).
+          float e = 0.01;
+          float b0 = skinBump(vObjPos);
+          vec3 g = vec3(skinBump(vObjPos + vec3(e, 0, 0)), skinBump(vObjPos + vec3(0, e, 0)), skinBump(vObjPos + vec3(0, 0, e))) - b0;
+          g /= e;
+          vec3 gv = mat3(viewMatrix) * g;
+          float strength = 0.002 * (1.0 - vShading.x);
+          normal = normalize(normal - strength * (gv - dot(gv, normal) * normal));
+        }`,
+      )
+      .replace(
+        '#include <lights_fragment_end>',
+        `#include <lights_fragment_end>
+        {
+          float ao = vShading.y;
+          reflectedLight.indirectDiffuse *= ao;
+          reflectedLight.indirectSpecular *= ao;
+          reflectedLight.directDiffuse *= mix(0.55, 1.0, ao);
+          reflectedLight.directSpecular *= mix(0.4, 1.0, ao);
+
+          float thin = exp(-vShading.z * 0.9);
+          vec3 blood = vec3(0.95, 0.32, 0.2);
+          // Light scattered inside the flesh fills the shadow side with warmth.
+          reflectedLight.indirectDiffuse += diffuseColor.rgb * blood * (0.1 + 0.35 * thin) * ao;
+          // Backlit thin parts (finger edges, webs) glow.
+          vec3 L = normalize(mat3(viewMatrix) * uBackLight);
+          float behind = pow(clamp(dot(-geometryViewDir, L), 0.0, 1.0), 2.0);
+          float edge = pow(1.0 - abs(dot(normal, geometryViewDir)), 2.0);
+          reflectedLight.directDiffuse += diffuseColor.rgb * blood * thin * (behind * 1.2 + edge * 0.25);
+        }`,
+      );
   };
 }
 

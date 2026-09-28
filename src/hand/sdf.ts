@@ -139,6 +139,14 @@ export function buildField(sk: Skeleton): Field {
     k: 0.9,
   });
 
+  // Back of the hand: the metacarpal heads stand proud as knuckles, and the
+  // extensor tendons fan out from the wrist to each of them.
+  for (const d of fingers) {
+    const h = d.joints[0];
+    palmEllipsoids.push({ e: makeEllipsoid([h[0], h[1] - 0.15, -0.5], [0.82, 0.9, 0.95]), k: 0.9 });
+    palmCones.push({ cone: makeCone([h[0] * 0.3 + 0.1, 0.6, -1.08], [h[0], h[1] - 0.5, -1.15], 0.13, 0.15), k: 0.35 });
+  }
+
   const forearm = makeCone([0.15, CUT_Y - 2, -0.1], [0.15, 2.3, -0.1], 2.85, 3.0);
 
   const digits: DigitField[] = sk.digits.map((d) => {
@@ -149,8 +157,8 @@ export function buildField(sk: Skeleton): Field {
       const s = d.segments[i];
       const prev = d.segments[i - 1];
       const back: Vec3 = [-(s.palmar[0] + prev.palmar[0]) / 2, -(s.palmar[1] + prev.palmar[1]) / 2, -(s.palmar[2] + prev.palmar[2]) / 2];
-      const r = s.ra * 0.72;
-      knuckles.push({ c: [s.a[0] + back[0] * (s.ra - r) * 0.9, s.a[1] + back[1] * (s.ra - r) * 0.9, s.a[2] + back[2] * (s.ra - r) * 0.9], r });
+      const r = s.ra * 0.55;
+      knuckles.push({ c: [s.a[0] + back[0] * (s.ra - r) * 0.6, s.a[1] + back[1] * (s.ra - r) * 0.6, s.a[2] + back[2] * (s.ra - r) * 0.6], r });
     }
     // Fleshy pads on the palmar side of each phalanx; the fingertip pulp is fullest.
     const pads = d.segments.map((s, i) => {
@@ -174,9 +182,11 @@ export function buildField(sk: Skeleton): Field {
   for (let i = 0; i + 1 < fingers.length; i++) {
     const at = (d: typeof fingers[number]) => {
       const s = d.segments[0];
-      return [0, 1, 2].map((k) => s.a[k] + s.axis[k] * 1.2 + s.palmar[k] * 0.15) as Vec3;
+      return [0, 1, 2].map((k) => s.a[k] + s.axis[k] * 0.95 + s.palmar[k] * 0.2) as Vec3;
     };
-    webs.push(makeCone(at(fingers[i]), at(fingers[i + 1]), 0.55, 0.55));
+    const divergence = Math.acos(Math.min(1, dot(fingers[i].segments[0].axis, fingers[i + 1].segments[0].axis)));
+    const r = 0.5 * (1 - smoothstep(0.1, 1.2, divergence)) + 0.15;
+    webs.push(makeCone(at(fingers[i]), at(fingers[i + 1]), r, r));
   }
   // The hollow of the palm between the eminences.
   const hollow = makeEllipsoid([-0.1, 6.0, 2.05], [2.0, 2.3, 1.0]);
@@ -185,9 +195,12 @@ export function buildField(sk: Skeleton): Field {
   const nodules: Ellipsoid[] = [];
   for (const c of sk.cords) {
     for (let i = 0; i + 1 < c.points.length; i++) {
-      cords.push(makeCone(c.points[i], c.points[i + 1], c.radius * 1.15, c.radius * 0.8));
+      // Cords fade into the palmar fascia at their proximal end and are
+      // thickest where they cross the knuckle.
+      const first = i === 0;
+      cords.push(makeCone(c.points[i], c.points[i + 1], c.radius * (first ? 0.45 : 0.9), c.radius * (first ? 1.0 : 0.75)));
     }
-    if (c.nodule) nodules.push(makeEllipsoid(c.nodule, [0.42, 0.6, 0.32], [1, 0, 0], c.noduleAxis));
+    if (c.nodule) nodules.push(makeEllipsoid(c.nodule, [0.48, 0.62, 0.26], [1, 0, 0], c.noduleAxis));
   }
 
   // Bounds from all digit joints plus the palm and forearm.
@@ -210,44 +223,59 @@ export function sdDigitCones(f: DigitField, x: number, y: number, z: number): nu
   return d;
 }
 
+/** Fingers are wider than they are deep, so squash each segment front to back. */
+const DEPTH = 0.86;
+
+function sdPhalanx(f: DigitField, i: number, x: number, y: number, z: number): number {
+  const c = f.cones[i];
+  const n = f.segments[i].palmar;
+  const w = ((x - c.ax) * n[0] + (y - c.ay) * n[1] + (z - c.az) * n[2]) * (1 / DEPTH - 1);
+  return sdCone(c, x + n[0] * w, y + n[1] * w, z + n[2] * w) * DEPTH;
+}
+
 function sdDigit(f: DigitField, x: number, y: number, z: number): number {
-  let d = sdCone(f.cones[0], x, y, z);
-  d = smin(d, sdCone(f.cones[1], x, y, z), 0.28);
-  const distal = sdCone(f.cones[2], x, y, z);
+  let d = sdPhalanx(f, 0, x, y, z);
+  d = smin(d, sdPhalanx(f, 1, x, y, z), 0.28);
+  const distal = sdPhalanx(f, 2, x, y, z);
   d = smin(d, distal, 0.22);
   for (const e of f.pads) d = smin(d, sdEllipsoid(e, x, y, z), 0.3);
   for (const kn of f.knuckles) {
     const dk = Math.hypot(x - kn.c[0], y - kn.c[1], z - kn.c[2]) - kn.r;
-    if (dk - 0.35 < d) d = smin(d, dk, 0.35);
+    if (dk - 0.45 < d) d = smin(d, dk, 0.45);
   }
   // Nail plate: a shallow raised shield on the back of the distal phalanx.
   if (distal < 0.3) {
     const n = nailCoords(f, x, y, z);
-    if (n.mask > 0) d -= 0.045 * n.mask;
+    if (n.mask > 0) d -= 0.06 * n.mask;
+    if (n.fold > 0) d += 0.015 * n.fold;
   }
   return d;
 }
 
 /** Local coordinates on the distal phalanx, used for the nail. */
-function nailCoords(f: DigitField, x: number, y: number, z: number): { mask: number; edge: number } {
+function nailCoords(f: DigitField, x: number, y: number, z: number): { mask: number; edge: number; fold: number } {
   const s = f.segments[2];
   const px = x - s.a[0], py = y - s.a[1], pz = z - s.a[2];
   const len = Math.hypot(s.b[0] - s.a[0], s.b[1] - s.a[1], s.b[2] - s.a[2]);
   const u = (px * s.axis[0] + py * s.axis[1] + pz * s.axis[2]) / len;
   const v = px * s.lateral[0] + py * s.lateral[1] + pz * s.lateral[2];
   const w = -(px * s.palmar[0] + py * s.palmar[1] + pz * s.palmar[2]);
-  if (w <= 0) return { mask: 0, edge: 0 };
+  if (w <= 0) return { mask: 0, edge: 0, fold: 0 };
   const halfWidth = (s.ra * 0.62 + s.rb * 0.62) / 2;
   // Proximal edge is a rounded cuticle; the plate runs to just past the tip.
   const across = Math.abs(v) / halfWidth;
   const start = 0.3 + 0.1 * across * across;
-  const along = smoothstep(start, start + 0.06, u) * (1 - smoothstep(1.02, 1.12, u));
-  const side = 1 - smoothstep(0.82, 1.0, across);
+  const along = smoothstep(start, start + 0.1, u) * (1 - smoothstep(1.0, 1.14, u));
+  const side = 1 - smoothstep(0.75, 1.0, across);
   const back = smoothstep(0.2, 0.55, w / s.rb);
   const mask = along * side * back;
   // Lunula and free edge are lighter.
   const edge = smoothstep(0.93, 1.0, u) + (1 - smoothstep(start + 0.03, start + 0.14, u)) * (1 - across);
-  return { mask, edge: Math.min(1, edge) * mask };
+  // The groove where the skin folds meet the plate, at the sides and cuticle.
+  const sideGroove = Math.exp(-(((across - 0.93) / 0.07) ** 2)) * smoothstep(start, start + 0.1, u) * (1 - smoothstep(0.95, 1.05, u));
+  const cuticle = Math.exp(-(((u - start) / 0.03) ** 2)) * (1 - smoothstep(0.85, 1.0, across));
+  const fold = Math.min(1, sideGroove + cuticle) * back;
+  return { mask, edge: Math.min(1, edge) * mask, fold };
 }
 
 function sdPalm(fd: Field, x: number, y: number, z: number): number {
@@ -326,12 +354,51 @@ const PALM_CREASES: [number, number][][] = [
   [[-2.2, -0.45], [0, -0.6], [2.3, -0.4]],
 ];
 
-export function colorAt(fd: Field, p: Vec3, n: Vec3): Vec3 {
+// Smooth value noise, for the uneven tone of real skin.
+function hash(i: number, j: number, k: number): number {
+  let h = (i * 374761393 + j * 668265263 + k * 1274126177) | 0;
+  h = Math.imul(h ^ (h >>> 13), 1274126177);
+  return ((h ^ (h >>> 16)) >>> 0) / 4294967295;
+}
+
+function noise3(x: number, y: number, z: number): number {
+  const i = Math.floor(x), j = Math.floor(y), k = Math.floor(z);
+  const fx = x - i, fy = y - j, fz = z - k;
+  const u = fx * fx * (3 - 2 * fx), v = fy * fy * (3 - 2 * fy), w = fz * fz * (3 - 2 * fz);
+  const l = (a: number, b: number, t: number) => a + (b - a) * t;
+  return l(
+    l(l(hash(i, j, k), hash(i + 1, j, k), u), l(hash(i, j + 1, k), hash(i + 1, j + 1, k), u), v),
+    l(l(hash(i, j, k + 1), hash(i + 1, j, k + 1), u), l(hash(i, j + 1, k + 1), hash(i + 1, j + 1, k + 1), u), v),
+    w,
+  );
+}
+
+// Superficial veins on the back of the hand, in the palm plane.
+const VEINS: [number, number][][] = [
+  [[-2.9, -2.5], [-2.6, 0.5], [-2.2, 2.6], [-1.6, 4.4], [-1.2, 6.2], [-1.0, 7.6]],
+  [[-2.2, 2.6], [-0.9, 3.6], [0.4, 4.3], [1.4, 5.6], [1.9, 7.2]],
+  [[0.4, 4.3], [0.6, 6.0], [0.8, 7.9]],
+  [[1.2, -2.5], [1.5, 0.4], [2.1, 2.2], [2.9, 3.6], [3.6, 4.6]],
+  [[-1.6, 4.4], [-2.6, 5.6], [-2.9, 7.0]],
+];
+const VEIN: Vec3 = [0.66, 0.6, 0.64];
+
+export interface Surface {
+  color: Vec3;
+  /** 0 for skin, 1 for the polished nail plate. */
+  gloss: number;
+}
+
+export function surfaceAt(fd: Field, p: Vec3, n: Vec3): Surface {
   const [x, y, z] = p;
-  if (y < fd.cutY + 0.02 && n[1] < -0.8) return CUT_FACE;
+  if (y < fd.cutY + 0.02 && n[1] < -0.8) return { color: CUT_FACE, gloss: 0 };
+  let gloss = 0;
 
   // Palmar skin is paler than dorsal skin.
   let c = mix(SKIN, PALM, smoothstep(-0.1, 0.6, n[2]));
+  // Blotchy variation in tone, warmer in some patches and paler in others.
+  const m = noise3(x * 0.9, y * 0.9, z * 0.9) * 0.6 + noise3(x * 2.3 + 7, y * 2.3, z * 2.3) * 0.4 - 0.5;
+  c = mix(c, m > 0 ? FLUSH : PALM, Math.abs(m) * 0.5);
 
   // Which digit, if any, is this point on?
   let best = Infinity;
@@ -370,10 +437,22 @@ export function colorAt(fd: Field, p: Vec3, n: Vec3): Vec3 {
         c = mix(c, CREASE, 0.3 * g * facing);
       }
     }
+    // Fine transverse wrinkles over the back of the PIP and DIP joints.
+    for (let i = 1; i < 3; i++) {
+      const s = segs[i];
+      const back = smoothstep(0.4, 0.85, -dot(n, s.palmar));
+      if (back <= 0) continue;
+      const u = (x - s.a[0]) * s.axis[0] + (y - s.a[1]) * s.axis[1] + (z - s.a[2]) * s.axis[2];
+      const span = i === 1 ? 0.45 : 0.3;
+      if (Math.abs(u) > span) continue;
+      const lines = 0.5 + 0.5 * Math.cos((u / span) * Math.PI * (i === 1 ? 4 : 3));
+      c = mix(c, CREASE, 0.14 * back * lines * (1 - Math.abs(u) / span));
+    }
     const nail = nailCoords(digit, x, y, z);
     if (nail.mask > 0) {
       c = mix(c, NAIL, nail.mask);
       c = mix(c, NAIL_EDGE, nail.edge * 0.8);
+      gloss = nail.mask;
     }
   } else {
     const facing = smoothstep(0.3, 0.75, n[2]);
@@ -383,6 +462,13 @@ export function colorAt(fd: Field, p: Vec3, n: Vec3): Vec3 {
         c = mix(c, CREASE, 0.26 * Math.exp(-((d / 0.075) ** 2)) * facing);
       }
     }
+    const back = smoothstep(0.2, 0.7, -n[2]) * (1 - smoothstep(-0.6, -0.2, z)) * (1 - smoothstep(7.4, 8.4, y));
+    if (back > 0) {
+      for (const line of VEINS) {
+        const d = distToPolyline(line, x, y);
+        c = mix(c, VEIN, 0.2 * Math.exp(-((d / 0.2) ** 2)) * back);
+      }
+    }
   }
 
   // Skin over a tense cord blanches slightly.
@@ -390,15 +476,43 @@ export function colorAt(fd: Field, p: Vec3, n: Vec3): Vec3 {
     const d = sdCone(cone, x, y, z);
     c = mix(c, BLANCH, 0.5 * (1 - smoothstep(0.05, 0.5, d)));
   }
-  return c;
+  return { color: c, gloss };
 }
 
+/**
+ * How open the sky is above a point (1) versus tucked into a crease or
+ * between fingers (0), sampled along the normal.
+ */
+export function occlusionAt(fd: Field, p: Vec3, n: Vec3): number {
+  let occ = 0;
+  let weight = 1;
+  for (const h of [0.15, 0.45, 0.95]) {
+    const d = sdf(fd, p[0] + n[0] * h, p[1] + n[1] * h, p[2] + n[2] * h);
+    occ += (h - Math.max(0, d)) * weight;
+    weight *= 0.55;
+  }
+  return Math.max(0, Math.min(1, 1 - 1.25 * occ));
+}
+
+/** Rough thickness of the flesh behind a point, for light bleeding through thin parts. */
+export function thicknessAt(fd: Field, p: Vec3, n: Vec3): number {
+  let depth = 0;
+  for (const t of [0.35, 0.8, 1.4]) {
+    const d = sdf(fd, p[0] - n[0] * t, p[1] - n[1] * t, p[2] - n[2] * t);
+    depth = Math.max(depth, -d);
+  }
+  return 2 * depth;
+}
+
+/** Surface normal from the field's gradient, using four tetrahedral samples. */
 export function normalAt(fd: Field, p: Vec3): Vec3 {
-  const e = 0.015;
+  const e = 0.012;
   const [x, y, z] = p;
-  const nx = sdf(fd, x + e, y, z) - sdf(fd, x - e, y, z);
-  const ny = sdf(fd, x, y + e, z) - sdf(fd, x, y - e, z);
-  const nz = sdf(fd, x, y, z + e) - sdf(fd, x, y, z - e);
+  const a = sdf(fd, x + e, y - e, z - e);
+  const b = sdf(fd, x - e, y - e, z + e);
+  const c = sdf(fd, x - e, y + e, z - e);
+  const d = sdf(fd, x + e, y + e, z + e);
+  const nx = a - b - c + d, ny = -a - b + c + d, nz = -a + b - c + d;
   const l = Math.hypot(nx, ny, nz) || 1;
   return [nx / l, ny / l, nz / l];
 }

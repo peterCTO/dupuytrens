@@ -231,5 +231,7 @@ renderSliders();
 renderCaption();
 
 // Handy for screenshots and debugging: ?view=ulnar
-const initial = new URLSearchParams(location.search).get('view') as ViewName | null;
+const params = new URLSearchParams(location.search);
+const initial = params.get('view') as ViewName | null;
 if (initial && initial in ASPECT_NAMES) view.goTo(initial, true);
+if (params.get('zoom')) view.zoom(Number(params.get('zoom')));

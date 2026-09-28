@@ -4,13 +4,15 @@
 // blocks of the grid can contain the surface, and everything else is filled
 // with the sign of the coarse sample.
 
-import { Field, sdf, colorAt, normalAt, sdDigitCones } from './sdf';
+import { Field, sdf, surfaceAt, normalAt, occlusionAt, thicknessAt, sdDigitCones } from './sdf';
 import { Skeleton, Vec3, add, norm, dot, sub } from './anatomy';
 
 export interface MeshData {
   positions: Float32Array;
   normals: Float32Array;
   colors: Float32Array;
+  /** Per vertex: nail gloss, ambient occlusion, flesh thickness. */
+  shading: Float32Array;
   indices: Uint32Array;
   /**
    * Skinning weights, 16 per vertex: for each of the four fingers,
@@ -45,38 +47,55 @@ function skinWeights(sk: Skeleton, fd: Field, p: Vec3, out: Float32Array, o: num
 
 const BLOCK = 4;
 
-export function meshField(sk: Skeleton, fd: Field, h: number): MeshData {
-  const pad = 2 * h;
-  const ox = fd.min[0] - pad, oy = fd.min[1] - pad, oz = fd.min[2] - pad;
-  const nx = Math.ceil((fd.max[0] - fd.min[0] + 2 * pad) / h / BLOCK) * BLOCK + 1;
-  const ny = Math.ceil((fd.max[1] - fd.min[1] + 2 * pad) / h / BLOCK) * BLOCK + 1;
-  const nz = Math.ceil((fd.max[2] - fd.min[2] + 2 * pad) / h / BLOCK) * BLOCK + 1;
-  const sx = 1, sy = nx, sz = nx * ny;
-  const values = new Float32Array(nx * ny * nz);
-  const known = new Uint8Array(nx * ny * nz);
+/** The sampling grid for a pose. Every worker derives the same grid from the same pose. */
+export interface Grid {
+  ox: number; oy: number; oz: number;
+  nx: number; ny: number; nz: number;
+  h: number;
+  /** Number of blocks along z; work is split across workers by block rows. */
+  bz: number;
+}
 
-  // Coarse pass at block centres.
-  const bx = (nx - 1) / BLOCK, by = (ny - 1) / BLOCK, bz = (nz - 1) / BLOCK;
+export function gridFor(fd: Field, h: number): Grid {
+  const pad = 2 * h;
+  const size = (a: number) => Math.ceil((fd.max[a] - fd.min[a] + 2 * pad) / h / BLOCK) * BLOCK + 1;
+  const nz = size(2);
+  return {
+    ox: fd.min[0] - pad, oy: fd.min[1] - pad, oz: fd.min[2] - pad,
+    nx: size(0), ny: size(1), nz, h,
+    bz: (nz - 1) / BLOCK,
+  };
+}
+
+/**
+ * Samples the field for block rows [kb0, kb1) of the grid: grid nodes
+ * kb0*BLOCK .. kb1*BLOCK inclusive. Blocks far from the skin are filled with
+ * the sign of their centre sample instead of being sampled node by node.
+ */
+export function sampleSlab(fd: Field, g: Grid, kb0: number, kb1: number): Float32Array {
+  const { ox, oy, oz, nx, ny, h } = g;
+  const nzLocal = (kb1 - kb0) * BLOCK + 1;
+  const sy = nx, sz = nx * ny;
+  const values = new Float32Array(nx * ny * nzLocal);
+  const known = new Uint8Array(nx * ny * nzLocal);
+  const bx = (nx - 1) / BLOCK, by = (ny - 1) / BLOCK;
   const reach = (Math.sqrt(3) * BLOCK * h) / 2;
   const far: { i: number; j: number; k: number; sign: number }[] = [];
-  for (let k = 0; k < bz; k++) {
+  for (let k = kb0; k < kb1; k++) {
     for (let j = 0; j < by; j++) {
       for (let i = 0; i < bx; i++) {
-        const cx = ox + (i + 0.5) * BLOCK * h;
-        const cy = oy + (j + 0.5) * BLOCK * h;
-        const cz = oz + (k + 0.5) * BLOCK * h;
-        const d = sdf(fd, cx, cy, cz);
+        const d = sdf(fd, ox + (i + 0.5) * BLOCK * h, oy + (j + 0.5) * BLOCK * h, oz + (k + 0.5) * BLOCK * h);
         if (Math.abs(d) > reach * 1.6 + h) {
-          far.push({ i, j, k, sign: Math.sign(d) });
+          far.push({ i, j, k: k - kb0, sign: Math.sign(d) });
           continue;
         }
         for (let c = 0; c <= BLOCK; c++) {
           for (let b = 0; b <= BLOCK; b++) {
             for (let a = 0; a <= BLOCK; a++) {
-              const gi = i * BLOCK + a, gj = j * BLOCK + b, gk = k * BLOCK + c;
-              const idx = gi + gj * sy + gk * sz;
+              const gi = i * BLOCK + a, gj = j * BLOCK + b, lk = (k - kb0) * BLOCK + c;
+              const idx = gi + gj * sy + lk * sz;
               if (known[idx]) continue;
-              values[idx] = sdf(fd, ox + gi * h, oy + gj * h, oz + gk * h);
+              values[idx] = sdf(fd, ox + gi * h, oy + gj * h, oz + (k * BLOCK + c) * h);
               known[idx] = 1;
             }
           }
@@ -94,8 +113,13 @@ export function meshField(sk: Skeleton, fd: Field, h: number): MeshData {
       }
     }
   }
+  return values;
+}
 
-  // One vertex per cell that the surface passes through.
+/** Surface Nets: one vertex per cell the skin passes through, quads between them. */
+export function extractSurface(g: Grid, values: Float32Array): { positions: Float32Array; indices: Uint32Array } {
+  const { ox, oy, oz, nx, ny, nz, h } = g;
+  const sx = 1, sy = nx, sz = nx * ny;
   const cellIndex = new Int32Array((nx - 1) * (ny - 1) * (nz - 1)).fill(-1);
   const cx1 = nx - 1, cy1 = ny - 1;
   const pos: number[] = [];
@@ -137,7 +161,6 @@ export function meshField(sk: Skeleton, fd: Field, h: number): MeshData {
     }
   }
 
-  // Quads across every grid edge where the sign changes.
   const idx: number[] = [];
   const cell = (i: number, j: number, k: number) => cellIndex[i + j * cx1 + k * cx1 * cy1];
   const quad = (a: number, b: number, c: number, d: number, flip: boolean) => {
@@ -148,36 +171,52 @@ export function meshField(sk: Skeleton, fd: Field, h: number): MeshData {
     for (let j = 1; j < ny - 1; j++) {
       for (let i = 1; i < nx - 1; i++) {
         const here = values[i + j * sy + k * sz] < 0;
-        if (i < nx - 1 && here !== values[i + 1 + j * sy + k * sz] < 0) {
+        if (here !== values[i + 1 + j * sy + k * sz] < 0) {
           quad(cell(i, j - 1, k - 1), cell(i, j, k - 1), cell(i, j, k), cell(i, j - 1, k), here);
         }
-        if (j < ny - 1 && here !== values[i + (j + 1) * sy + k * sz] < 0) {
+        if (here !== values[i + (j + 1) * sy + k * sz] < 0) {
           quad(cell(i - 1, j, k - 1), cell(i - 1, j, k), cell(i, j, k), cell(i, j, k - 1), here);
         }
-        if (k < nz - 1 && here !== values[i + j * sy + (k + 1) * sz] < 0) {
+        if (here !== values[i + j * sy + (k + 1) * sz] < 0) {
           quad(cell(i - 1, j - 1, k), cell(i, j - 1, k), cell(i, j, k), cell(i - 1, j, k), here);
         }
       }
     }
   }
+  return { positions: new Float32Array(pos), indices: new Uint32Array(idx) };
+}
 
-  // Project vertices onto the surface, then shade them.
-  const count = pos.length / 3;
-  const positions = new Float32Array(pos);
+export type VertexData = Omit<MeshData, 'indices'>;
+
+/** Projects rough vertices onto the skin and works out how each one is shaded and skinned. */
+export function shadeVertices(sk: Skeleton, fd: Field, rough: Float32Array): VertexData {
+  const count = rough.length / 3;
+  const positions = new Float32Array(count * 3);
   const normals = new Float32Array(count * 3);
   const colors = new Float32Array(count * 3);
   const weights = new Float32Array(count * 16);
+  const shading = new Float32Array(count * 3);
   for (let n = 0; n < count; n++) {
-    let p: [number, number, number] = [positions[3 * n], positions[3 * n + 1], positions[3 * n + 2]];
+    let p: [number, number, number] = [rough[3 * n], rough[3 * n + 1], rough[3 * n + 2]];
     const d = sdf(fd, p[0], p[1], p[2]);
-    let nrm = normalAt(fd, p);
+    const nrm = normalAt(fd, p);
     p = [p[0] - nrm[0] * d, p[1] - nrm[1] * d, p[2] - nrm[2] * d];
-    if (Math.abs(d) > 0.02) nrm = normalAt(fd, p);
-    const col = colorAt(fd, p, nrm);
+    const surface = surfaceAt(fd, p, nrm);
     positions.set(p, 3 * n);
     normals.set(nrm, 3 * n);
-    colors.set(col, 3 * n);
+    colors.set(surface.color, 3 * n);
+    shading[3 * n] = surface.gloss;
+    shading[3 * n + 1] = occlusionAt(fd, p, nrm);
+    shading[3 * n + 2] = thicknessAt(fd, p, nrm);
     skinWeights(sk, fd, p, weights, 16 * n);
   }
-  return { positions, normals, colors, weights, indices: new Uint32Array(idx) };
+  return { positions, normals, colors, shading, weights };
+}
+
+/** Builds the whole mesh on one thread. */
+export function meshField(sk: Skeleton, fd: Field, h: number): MeshData {
+  const g = gridFor(fd, h);
+  const values = sampleSlab(fd, g, 0, g.bz);
+  const surface = extractSurface(g, values);
+  return { ...shadeVertices(sk, fd, surface.positions), indices: surface.indices };
 }
