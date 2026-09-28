@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Dupuytren's Hand</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com" />
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+    <link
+      href="https://fonts.googleapis.com/css2?family=EB+Garamond:ital,wght@0,400;0,500;0,600;1,400&display=swap"
+      rel="stylesheet"
+    />
+  </head>
+  <body>
+    <main class="plate">
+      <header class="plate-head">
+        <p class="plate-no">Plate I</p>
+        <h1>The Hand in Dupuytren&rsquo;s Contracture</h1>
+      </header>
+
+      <figure class="figure">
+        <div id="viewport" class="viewport" aria-label="Interactive 3D model of a right hand"></div>
+        <p class="busy" id="busy" hidden>Modelling&hellip;</p>
+        <figcaption id="caption"></figcaption>
+      </figure>
+
+      <aside class="panel" aria-label="Configure the contracture">
+        <section>
+          <h2>Digits</h2>
+          <p class="hint">Mark the affected fingers, then choose one to adjust.</p>
+          <ul id="fingers" class="fingers"></ul>
+        </section>
+
+        <section id="joints">
+          <h2 id="joints-title">Ring finger</h2>
+          <div id="sliders"></div>
+          <p id="stage" class="stage"></p>
+        </section>
+
+        <section>
+          <h2>Aspect</h2>
+          <div class="views" id="views">
+            <button data-view="palmar">Palmar</button>
+            <button data-view="ulnar">Ulnar</button>
+            <button data-view="radial">Radial</button>
+            <button data-view="dorsal">Dorsal</button>
+          </div>
+          <p class="hint">Drag to turn the model; scroll or pinch to zoom.</p>
+        </section>
+
+        <section class="note">
+          <p>
+            In Dupuytren&rsquo;s disease the palmar fascia thickens into nodules and cords. As a cord
+            contracts it draws the finger into flexion at the knuckle (MCP) and middle joint (PIP),
+            and it stands out under the skin like a bowstring.
+          </p>
+        </section>
+      </aside>
+    </main>
+    <script type="module" src="/src/main.ts"></script>
+  </body>
+</html>
