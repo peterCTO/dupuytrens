@@ -6,7 +6,8 @@
 // creases of a real hand without a hand-sculpted mesh, and lets the pose be
 // rebuilt exactly for any finger angles.
 
-import { Skeleton, Vec3, Segment, Wound, norm, cross, dot } from './anatomy';
+import { Skeleton, Vec3, Segment, norm, cross, dot } from './anatomy';
+import { P2, SiteGeom, framePoint, polygonDistance, toFrame, zShape } from './surgery';
 
 interface Cone {
   ax: number; ay: number; az: number;
@@ -47,7 +48,11 @@ export interface Field {
   digits: DigitField[];
   cords: Cone[];
   nodules: Ellipsoid[];
-  wound: WoundField | null;
+  sites: SiteField[];
+  /** Which surface this field describes: the hand itself, or a dressing over it. */
+  layer: Layer;
+  /** Digits (by index) that the bandage covers. */
+  dressed: number[];
   cutY: number;
   min: Vec3;
   max: Vec3;
@@ -55,41 +60,24 @@ export interface Field {
 
 export const CUT_Y = -3.0;
 
-/** An open wound: a bowl-shaped ellipse cut down to the level of the cord. */
-export interface WoundField {
-  /** Centre, unit axis along the ray, half length and half width, in the palm plane. */
-  cx: number; cy: number; ux: number; uy: number;
-  rx: number; ry: number;
-  floor: number;
-  /** The ray's cords, laid bare in the wound. */
+export type Layer = 'skin' | 'bandage' | 'cast';
+
+/** An open Z-plasty: the window under its two flaps is hollowed out down to the cord. */
+export interface SiteField {
+  geom: SiteGeom;
+  window: P2[];
+  /** Bounding sphere of the hollow. */
+  bc: Vec3;
+  br: number;
+  /** Cords that pass under the window, laid bare in it. */
   cords: Cone[];
 }
 
-function woundField(w: Wound, cords: Cone[]): WoundField {
-  const dx = w.b[0] - w.a[0], dy = w.b[1] - w.a[1];
-  const len = Math.hypot(dx, dy);
-  return {
-    cx: (w.a[0] + w.b[0]) / 2, cy: (w.a[1] + w.b[1]) / 2,
-    ux: dx / len, uy: dy / len,
-    rx: len / 2 + 0.3, ry: w.halfWidth,
-    floor: w.floor,
-    cords,
-  };
-}
-
-/**
- * Signed distance to the hollow of the wound (negative inside it). The walls
- * slope in towards the floor, as skin and fat do when held apart.
- */
-export function woundCavity(w: WoundField, x: number, y: number, z: number): number {
-  const px = x - w.cx, py = y - w.cy;
-  const u = px * w.ux + py * w.uy;
-  const v = -px * w.uy + py * w.ux;
-  const open = 0.7 + 0.3 * smoothstep(w.floor, w.floor + 0.9, z);
-  const rx = w.rx * (0.8 + 0.2 * open), ry = w.ry * open;
-  const k = Math.hypot(u / rx, v / ry);
-  const e = (k - 1) * Math.min(rx, ry);
-  return Math.max(e, w.floor - z);
+/** Signed distance to the hollow under a site's flaps (negative inside), given the body's own distance. */
+export function siteCavity(sf: SiteField, x: number, y: number, z: number, body: number): number {
+  const [u, v, w] = toFrame(sf.geom.frame, [x, y, z]);
+  const poly = polygonDistance(sf.window, u, v);
+  return Math.max(poly, -body - sf.geom.depth, -sf.geom.back - w);
 }
 
 function makeCone(a: Vec3, b: Vec3, r1: number, r2: number): Cone {
@@ -148,7 +136,7 @@ const smoothstep = (e0: number, e1: number, x: number) => {
   return t * t * (3 - 2 * t);
 };
 
-export function buildField(sk: Skeleton): Field {
+export function buildField(sk: Skeleton, openSites: SiteGeom[] = [], layer: Layer = 'skin', dressed: string[] = []): Field {
   const palmCones: { cone: Cone; k: number }[] = [];
   const palmEllipsoids: { e: Ellipsoid; k: number }[] = [];
 
@@ -231,7 +219,11 @@ export function buildField(sk: Skeleton): Field {
 
   const cords: Cone[] = [];
   const nodules: Ellipsoid[] = [];
-  const exposed: Cone[] = [];
+  const sites: SiteField[] = openSites.map((geom) => {
+    const window = zShape(geom.limb).window;
+    const bc = framePoint(geom.frame, 0, 0, 0);
+    return { geom, window, bc, br: geom.limb * 0.9 + geom.depth + 1.2, cords: [] };
+  });
   for (const c of sk.cords) {
     for (let i = 0; i + 1 < c.points.length; i++) {
       // Cords fade into the palmar fascia at their proximal end and are
@@ -239,7 +231,7 @@ export function buildField(sk: Skeleton): Field {
       const first = i === 0;
       const cone = makeCone(c.points[i], c.points[i + 1], c.radius * (first ? 0.45 : 0.9), c.radius * (first ? 1.0 : 0.75));
       cords.push(cone);
-      if (sk.wound && c.finger === sk.wound.finger) exposed.push(cone);
+      for (const sf of sites) if (passesUnder(sf, c.points[i], c.points[i + 1])) sf.cords.push(cone);
     }
     if (c.nodule) nodules.push(makeEllipsoid(c.nodule, [0.48, 0.62, 0.26], [1, 0, 0], c.noduleAxis));
   }
@@ -255,8 +247,24 @@ export function buildField(sk: Skeleton): Field {
       }
     }
   }
-  const wound = sk.wound ? woundField(sk.wound, exposed) : null;
-  return { palmCones, palmEllipsoids, forearm, webs, hollow, digits, cords, nodules, wound, cutY: CUT_Y, min, max };
+  if (layer !== 'skin') {
+    for (let a = 0; a < 3; a++) {
+      min[a] -= 0.9;
+      max[a] += 0.9;
+    }
+  }
+  const dressedDigits = sk.digits.map((d, i) => (dressed.includes(d.id) ? i : -1)).filter((i) => i >= 0);
+  return { palmCones, palmEllipsoids, forearm, webs, hollow, digits, cords, nodules, sites, layer, dressed: dressedDigits, cutY: CUT_Y, min, max };
+}
+
+/** Whether a cord segment runs under a site's window. */
+function passesUnder(sf: SiteField, a: Vec3, b: Vec3): boolean {
+  for (let t = 0; t <= 1; t += 0.05) {
+    const p: Vec3 = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, a[2] + (b[2] - a[2]) * t];
+    const [u, v, w] = toFrame(sf.geom.frame, p);
+    if (w > -sf.geom.back && polygonDistance(sf.window, u, v) < 0.1) return true;
+  }
+  return false;
 }
 
 export function sdDigitCones(f: DigitField, x: number, y: number, z: number): number {
@@ -355,15 +363,52 @@ function sdBody(fd: Field, x: number, y: number, z: number): number {
   return d;
 }
 
+// --- Dressings ---------------------------------------------------------------
+
+function sdSegment(x: number, y: number, z: number, a: Vec3, b: Vec3): number {
+  const bx = b[0] - a[0], by = b[1] - a[1], bz = b[2] - a[2];
+  const t = Math.max(0, Math.min(1, ((x - a[0]) * bx + (y - a[1]) * by + (z - a[2]) * bz) / (bx * bx + by * by + bz * bz)));
+  return Math.hypot(x - a[0] - bx * t, y - a[1] - by * t, z - a[2] - bz * t);
+}
+
+/**
+ * A crepe bandage from the wrist over the palm and along the operated
+ * fingers, or a plaster slab along the back of the hand and fingers. Both
+ * are offsets of the skin, trimmed to where they are applied.
+ */
+function sdDressing(fd: Field, x: number, y: number, z: number): number {
+  const body = sdBody(fd, x, y, z);
+  const wrist = fd.cutY + 0.7 - y;
+  if (fd.layer === 'bandage') {
+    // Slightly lumpy where the turns overlap.
+    const turns = 0.025 * Math.sin((y + 0.35 * Math.atan2(z, x)) * 5.5);
+    let region = y - 10.3;
+    for (const i of fd.dressed) {
+      const d = fd.digits[i].segments;
+      const end: Vec3 = [0, 1, 2].map((k) => d[1].a[k] + (d[1].b[k] - d[1].a[k]) * 0.55) as Vec3;
+      region = Math.min(region, Math.min(sdSegment(x, y, z, d[0].a, d[0].b), sdSegment(x, y, z, d[1].a, end)) - 1.3);
+    }
+    return -smin(-(body - 0.2 - turns), -Math.max(region, wrist), 0.12);
+  }
+  // Plaster: the back half of a thick shell, from the wrist to beyond the fingertips.
+  let reach = -Infinity;
+  for (const d of fd.digits) if (d.isThumb === false) reach = Math.max(reach, d.segments[2].b[1]);
+  const back = z + 0.15;
+  const tips = y - (reach + 0.3);
+  return -smin(-(body - 0.55), -Math.max(back, wrist, tips), 0.2);
+}
+
 export function sdf(fd: Field, x: number, y: number, z: number): number {
-  let d = sdBody(fd, x, y, z);
-  const w = fd.wound;
-  if (w) {
-    const cavity = woundCavity(w, x, y, z);
-    if (cavity < 0.4) {
-      // Carve the hollow with softly rounded edges, then lay the cord back in it.
-      d = -smin(-d, cavity, 0.1);
-      for (const c of w.cords) d = smin(d, sdCone(c, x, y, z), 0.12);
+  if (fd.layer !== 'skin') return sdDressing(fd, x, y, z);
+  const body = sdBody(fd, x, y, z);
+  let d = body;
+  for (const sf of fd.sites) {
+    if (Math.hypot(x - sf.bc[0], y - sf.bc[1], z - sf.bc[2]) > sf.br) continue;
+    const cavity = siteCavity(sf, x, y, z, body);
+    if (cavity < 0.3) {
+      // Hollow out under the flaps with softly rounded edges, then lay the cord back in it.
+      d = -smin(-d, cavity, 0.06);
+      for (const c of sf.cords) d = smin(d, sdCone(c, x, y, z), 0.1);
     }
   }
   // Clean cut across the forearm, as on a display model, with a small bevel.
@@ -463,8 +508,16 @@ export interface Surface {
   crease: [number, number, number, number];
 }
 
+const BANDAGE: Vec3 = [0.93, 0.89, 0.8];
+const PLASTER: Vec3 = [0.95, 0.94, 0.91];
+
 export function surfaceAt(fd: Field, p: Vec3, n: Vec3): Surface {
   const [x, y, z] = p;
+  if (fd.layer !== 'skin') {
+    const tone = (noise3(x * 3, y * 3, z * 3) - 0.5) * 0.04;
+    const c = fd.layer === 'bandage' ? BANDAGE : PLASTER;
+    return { color: [c[0] + tone, c[1] + tone, c[2] + tone], gloss: 0, crease: [9, 0, 0, fd.layer === 'bandage' ? -2 : -3] };
+  }
   if (y < fd.cutY + 0.02 && n[1] < -0.8) return { color: CUT_FACE, gloss: 0, crease: [9, 0, 0, 0] };
   let gloss = 0;
 
@@ -553,17 +606,18 @@ export function surfaceAt(fd: Field, p: Vec3, n: Vec3): Surface {
     c = mix(c, BLANCH, 0.5 * (1 - smoothstep(0.05, 0.5, d)));
   }
 
-  const w = fd.wound;
-  if (w) {
-    const inWound = 1 - smoothstep(0.0, 0.07, woundCavity(w, x, y, z));
+  const body = fd.sites.length ? sdBody(fd, x, y, z) : 0;
+  for (const sf of fd.sites) {
+    if (Math.hypot(x - sf.bc[0], y - sf.bc[1], z - sf.bc[2]) > sf.br) continue;
+    const inWound = 1 - smoothstep(0.0, 0.06, siteCavity(sf, x, y, z, body));
     if (inWound > 0) {
       // Cut edge of the skin, then fat down the walls, fascia on the floor
       // and the pearly cord lying in it.
-      const depth = -sdBody(fd, x, y, z);
-      let t = mix(FAT, FASCIA, smoothstep(w.floor + 0.25, w.floor + 0.05, z));
-      t = mix(t, DERMIS, smoothstep(0.2, 0.08, depth));
+      const depth = -body;
+      let t = mix(FAT, FASCIA, smoothstep(sf.geom.depth - 0.2, sf.geom.depth - 0.05, depth));
+      t = mix(t, DERMIS, smoothstep(0.16, 0.06, depth));
       let cordD = Infinity;
-      for (const cone of w.cords) cordD = Math.min(cordD, sdCone(cone, x, y, z));
+      for (const cone of sf.cords) cordD = Math.min(cordD, sdCone(cone, x, y, z));
       const onCord = 1 - smoothstep(0.02, 0.09, cordD);
       t = mix(t, CORD, onCord);
       c = mix(c, t, inWound);

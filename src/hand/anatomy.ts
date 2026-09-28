@@ -85,41 +85,37 @@ export interface Digit {
   affected: boolean;
 }
 
+export type CordKind = 'palm' | 'digital';
+
 export interface Cord {
   finger: FingerId;
+  kind: CordKind;
   points: Vec3[];
   radius: number;
   nodule: Vec3 | null;
   noduleAxis: Vec3;
 }
 
-/** An open wound in the palm: an ellipse around the central limb of the Z-plasty. */
-export interface Wound {
+/** A Z-plasty site: one in the palm and one over the proximal phalanx of each operated finger. */
+export interface SiteSpec {
   finger: FingerId;
-  /** Proximal and distal ends of the central limb, in the palm plane. */
-  a: [number, number];
-  b: [number, number];
-  /** How far the skin edges are held apart on each side, cm. */
-  halfWidth: number;
-  /** Depth of the wound floor (z), just under the cord's midline. */
-  floor: number;
+  where: 'palm' | 'finger';
+  /** Incised with the flaps raisable, so the field has a hollow under them. */
+  open: boolean;
 }
 
-/** How far an operation on one ray has got, as far as the model's shape is concerned. */
+/** How far an operation has got, as far as the model's shape is concerned. */
 export interface Operation {
-  finger: FingerId;
-  a: [number, number];
-  b: [number, number];
-  /** Flaps raised and held open with skin hooks. */
-  open: boolean;
-  /** The ray's cords have been cut out. */
-  excised: boolean;
+  sites: SiteSpec[];
+  /** Cords cut out, as `finger:kind`. */
+  excised: string[];
 }
+
+export const cordKey = (finger: FingerId, kind: CordKind) => `${finger}:${kind}`;
 
 export interface Skeleton {
   digits: Digit[];
   cords: Cord[];
-  wound: Wound | null;
 }
 
 const deg = Math.PI / 180;
@@ -211,6 +207,7 @@ function palmCord(digit: Digit, pose: FingerPose): Cord {
   nodule[2] = PALM_DEPTH + 0.3;
   return {
     finger: digit.id as FingerId,
+    kind: 'palm',
     points: [origin, end],
     radius: 0.28 + 0.12 * severity(pose),
     nodule,
@@ -222,7 +219,7 @@ function palmCord(digit: Digit, pose: FingerPose): Cord {
 // phalanx onto the base of the middle phalanx, with or without a palm cord.
 function digitalCord(digit: Digit, pose: FingerPose): Cord {
   const points = [palmarPoint(digit.segments[0], 0.25, 0.3), palmarPoint(digit.segments[1], 0.2, 0.3)];
-  return { finger: digit.id as FingerId, points, radius: 0.24 + 0.1 * severity(pose), nodule: null, noduleAxis: norm(sub(points[1], points[0])) };
+  return { finger: digit.id as FingerId, kind: 'digital', points, radius: 0.24 + 0.1 * severity(pose), nodule: null, noduleAxis: norm(sub(points[1], points[0])) };
 }
 
 export function buildSkeleton(pose: HandPose, op: Operation | null = null): Skeleton {
@@ -232,15 +229,14 @@ export function buildSkeleton(pose: HandPose, op: Operation | null = null): Skel
     const digit = fingerDigit(id, pose[id]);
     digits.push(digit);
     const p = pose[id];
-    if (op?.excised && op.finger === id) continue;
-    if (p.cord.present) cords.push(palmCord(digit, p));
-    if (p.affected && p.pip > 5) cords.push(digitalCord(digit, p));
+    const gone = op?.excised ?? [];
+    if (p.cord.present && !gone.includes(cordKey(id, 'palm'))) cords.push(palmCord(digit, p));
+    if (hasDigitalCord(p) && !gone.includes(cordKey(id, 'digital'))) cords.push(digitalCord(digit, p));
   }
-  const wound: Wound | null = op?.open ? { finger: op.finger, a: op.a, b: op.b, halfWidth: WOUND_HALF_WIDTH, floor: PALM_DEPTH - 0.08 } : null;
-  return { digits, cords, wound };
+  return { digits, cords };
 }
 
-export const WOUND_HALF_WIDTH = 0.85;
+export const hasDigitalCord = (p: FingerPose) => p.affected && p.pip > 5;
 
 /** Total passive extension deficit, used for Tubiana staging. */
 export function totalDeficit(p: FingerPose): number {

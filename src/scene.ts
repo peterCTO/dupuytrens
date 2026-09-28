@@ -4,10 +4,10 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/examples/jsm/controls/OrbitControls.js';
 import { RoomEnvironment } from 'three/examples/jsm/environments/RoomEnvironment.js';
-import { HandPose, Operation, WOUND_HALF_WIDTH, buildSkeleton } from './hand/anatomy';
-import { CUT_Y, PALM_CREASES, Field, buildField, sdf } from './hand/sdf';
-import type { P2, ZPlan } from './hand/surgery';
-import { makeBundles, makeHooks, makeScalpel, makeSutures, poseScalpel } from './instruments';
+import { HandPose, Operation, Vec3 } from './hand/anatomy';
+import { CUT_Y, PALM_CREASES, Field, Layer, normalAt, sdf } from './hand/sdf';
+import { SiteFrame, SiteGeom, fieldFor, framePoint } from './hand/surgery';
+import { makeMarker, makeNeedle, makeScalpel, poseTool } from './instruments';
 import { skinMesh } from './hand/skin';
 import { MeshBuilder } from './hand/builder';
 import { growHair } from './hand/hair';
@@ -36,19 +36,33 @@ interface Bind {
 
 const clonePose = (p: HandPose): HandPose => JSON.parse(JSON.stringify(p));
 
-/** What is drawn on the skin during an operation. */
-export interface SkinMarks {
-  /** The incision path, D-A-B-C. */
-  incision: P2[];
-  /** How much of it has been marked in violet, and how much cut, in cm. */
+/** What is drawn on the skin at one Z-plasty site. */
+export interface SiteMarks {
+  geom: SiteGeom;
+  /** How much of the Z has been marked in violet, and how much cut, in cm along it. */
   marked: number;
   cut: number;
-  /** The closed Z, drawn once the flaps are transposed. */
-  scar: P2[] | null;
+  /** Draw the closed, transposed Z instead. */
+  scar: boolean;
+  /** Show a faint guide for the marker to follow. */
+  guide: boolean;
 }
 
-export type ToolName = 'scalpel' | 'forceps' | 'needle';
+export const MAX_SITES = 8;
+
+export type ToolName = 'marker' | 'scalpel' | 'hand' | 'needle' | 'wrap';
 export type PointerKind = 'down' | 'move' | 'up';
+
+export interface PointerInfo {
+  kind: PointerKind;
+  /** Where the pointer meets the skin, in the hand's frame. */
+  hit: THREE.Vector3 | null;
+  /** The pickable object under the pointer, if any. */
+  object: THREE.Object3D | null;
+  /** Pointer position in CSS pixels within the canvas. */
+  screen: THREE.Vector2;
+  pressed: boolean;
+}
 
 export class HandView {
   onBusy: (busy: boolean) => void = () => {};
@@ -73,21 +87,25 @@ export class HandView {
   /** The field of the mesh on screen, for finding where the pointer meets the skin. */
   private pickField: Field | null = null;
   private marks = {
-    uCut: { value: [0, 1, 2, 3].map(() => new THREE.Vector2()) },
-    uMarkLen: { value: 0 },
-    uCutLen: { value: 0 },
-    uScar: { value: [0, 1, 2, 3].map(() => new THREE.Vector2()) },
-    uScarOn: { value: 0 },
+    uSiteO: { value: Array.from({ length: MAX_SITES }, () => new THREE.Vector3()) },
+    uSiteU: { value: Array.from({ length: MAX_SITES }, () => new THREE.Vector3()) },
+    uSiteV: { value: Array.from({ length: MAX_SITES }, () => new THREE.Vector3()) },
+    uSiteN: { value: Array.from({ length: MAX_SITES }, () => new THREE.Vector3()) },
+    uSiteL: { value: Array.from({ length: MAX_SITES }, () => new THREE.Vector4()) },
+    uSiteState: { value: Array.from({ length: MAX_SITES }, () => new THREE.Vector4()) },
+    uSiteCount: { value: 0 },
   };
-  private surgical = new THREE.Group();
-  private hooks: THREE.Group | null = null;
-  private bundles: THREE.Group | null = null;
-  private sutures: THREE.Group | null = null;
-  private scalpel = makeScalpel();
+  /** Flaps, sutures and other surgical detail, in the hand's frame. */
+  readonly surgical = new THREE.Group();
+  /** Objects the pointer can pick up (flaps). */
+  pickables: THREE.Object3D[] = [];
+  private tools: Record<string, THREE.Object3D> = { scalpel: makeScalpel(), marker: makeMarker(), needle: makeNeedle() };
   private tool: ToolName | null = null;
   private dragging = false;
-  /** Called with where the pointer meets the hand (in the hand's frame), when a tool is in use. */
-  onPointer: (kind: PointerKind, hit: THREE.Vector3 | null) => void = () => {};
+  private layers: Partial<Record<Layer, THREE.Mesh>> = {};
+  private reveal = { bandage: { value: -99 }, cast: { value: -99 } };
+  /** Called with the pointer's state while a tool is in use. */
+  onPointer: (info: PointerInfo) => void = () => {};
   /** Called whenever a new mesh has been built and is on screen. */
   onMeshReady: () => void = () => {};
   private lastAspect: ViewName = 'palmar';
@@ -144,8 +162,10 @@ export class HandView {
     this.hairFixed = new THREE.LineSegments(new THREE.BufferGeometry(), hairMaterial);
     this.hairFingers = new THREE.LineSegments(new THREE.BufferGeometry(), hairMaterial);
     this.hand.add(this.hairFixed, this.hairFingers, this.surgical);
-    this.scalpel.visible = false;
-    this.hand.add(this.scalpel);
+    for (const t of Object.values(this.tools)) {
+      t.visible = false;
+      this.hand.add(t);
+    }
     this.setupPointer();
 
     this.request(DRAFT);
@@ -226,6 +246,12 @@ export class HandView {
     this.fly(TARGET.clone(), to, instant);
   }
 
+  /** Fly to one of the standard aspects, far enough back to see the whole hand. */
+  overview(name: ViewName) {
+    const to = TARGET.clone().add(VIEWS[name].clone().sub(TARGET).setLength(52));
+    this.fly(TARGET.clone(), to, false);
+  }
+
   /** Look at a point on the hand (its own frame) from a direction and distance. */
   focus(at: THREE.Vector3, dir: THREE.Vector3, distance: number, instant = false) {
     const target = at.clone().add(this.hand.position);
@@ -250,52 +276,101 @@ export class HandView {
     this.request(FINE);
   }
 
-  setMarks(m: SkinMarks | null) {
+  /** The skin's own material, for pieces of skin (flaps) made outside the mesher. */
+  get skinMaterial(): THREE.Material {
+    return this.material;
+  }
+
+  get currentPose(): HandPose {
+    return this.pose;
+  }
+
+  setSiteMarks(sites: SiteMarks[]) {
     const u = this.marks;
-    u.uMarkLen.value = m ? m.marked : 0;
-    u.uCutLen.value = m ? m.cut : 0;
-    u.uScarOn.value = m?.scar ? 1 : 0;
-    if (m) m.incision.forEach((p, i) => u.uCut.value[i].set(p[0], p[1]));
-    if (m?.scar) m.scar.forEach((p, i) => u.uScar.value[i].set(p[0], p[1]));
-  }
-
-  /** Skin hooks and the nerves and arteries in the open wound. */
-  setWoundDetail(plan: ZPlan | null) {
-    for (const g of [this.hooks, this.bundles]) if (g) this.surgical.remove(g);
-    this.hooks = this.bundles = null;
-    if (!plan) return;
-    this.hooks = makeHooks(plan, WOUND_HALF_WIDTH, (x, y) => this.surfaceZ(x, y));
-    this.bundles = makeBundles(plan, buildSkeleton(this.pose, this.op).wound?.floor ?? 0.87);
-    this.surgical.add(this.hooks, this.bundles);
-  }
-
-  setSutures(stitches: { at: P2; dir: P2 }[]) {
-    if (this.sutures) this.surgical.remove(this.sutures);
-    this.sutures = stitches.length ? makeSutures(stitches, (x, y) => this.surfaceZ(x, y)) : null;
-    if (this.sutures) this.surgical.add(this.sutures);
+    u.uSiteCount.value = Math.min(MAX_SITES, sites.length);
+    sites.slice(0, MAX_SITES).forEach((m, i) => {
+      const f = m.geom.frame;
+      u.uSiteO.value[i].set(...f.o);
+      u.uSiteU.value[i].set(...f.u);
+      u.uSiteV.value[i].set(...f.v);
+      u.uSiteN.value[i].set(...f.n);
+      u.uSiteL.value[i].set(m.geom.limb, m.geom.back, 0, 0);
+      u.uSiteState.value[i].set(m.marked, m.cut, m.scar ? 1 : 0, m.guide ? 1 : 0);
+    });
   }
 
   setTool(tool: ToolName | null) {
     this.tool = tool;
-    this.renderer.domElement.style.cursor = tool === 'scalpel' ? 'none' : tool ? 'pointer' : '';
-    if (tool !== 'scalpel') this.scalpel.visible = false;
+    const drawn = tool === 'scalpel' || tool === 'marker' || tool === 'needle';
+    this.renderer.domElement.style.cursor = drawn ? 'none' : tool === 'hand' ? 'grab' : tool ? 'crosshair' : '';
+    for (const [name, t] of Object.entries(this.tools)) if (name !== tool) t.visible = false;
   }
 
-  /** Show the scalpel with its tip at a point on the skin, travelling along cutDir. */
-  showScalpel(at: THREE.Vector3 | null, cutDir: P2) {
-    this.scalpel.visible = at !== null && this.tool === 'scalpel';
-    if (at) poseScalpel(this.scalpel, at, cutDir);
+  /** Show the current tool touching the skin at a point, moving along dir, with the skin's normal n. */
+  showTool(at: THREE.Vector3 | null, dir: Vec3, n: Vec3) {
+    const t = this.tool ? this.tools[this.tool] : undefined;
+    if (!t) return;
+    t.visible = at !== null;
+    if (at) poseTool(t, at, new THREE.Vector3(...dir), new THREE.Vector3(...n));
   }
 
-  /** Height of the palm's surface above (x, y), found by marching down from above. */
-  surfaceZ(x: number, y: number): number {
-    const hit = this.march(new THREE.Vector3(x, y, 6), new THREE.Vector3(0, 0, -1));
-    return hit ? hit.z : 1.5;
+  /** Where the skin is under a point of a site's frame, marching in along -n. */
+  surfacePoint(f: SiteFrame, u: number, v: number, fd: Field | null = this.pickField): { p: Vec3; hit: boolean } {
+    const start = framePoint(f, u, v, 3);
+    const hit = fd ? this.march(new THREE.Vector3(...start), new THREE.Vector3(...f.n).negate(), fd) : null;
+    return hit ? { p: [hit.x, hit.y, hit.z], hit: true } : { p: framePoint(f, u, v, 0.8), hit: false };
+  }
+
+  /** The skin's normal at a point, from the field of the mesh on screen. */
+  normalAt(p: Vec3): Vec3 {
+    return this.pickField ? normalAt(this.pickField, p) : [0, 0, 1];
+  }
+
+  /** A point in the hand's frame, in CSS pixels on the canvas. */
+  toScreen(p: Vec3): THREE.Vector2 {
+    const v = new THREE.Vector3(...p).add(this.hand.position).project(this.camera);
+    const rect = this.renderer.domElement.getBoundingClientRect();
+    return new THREE.Vector2(((v.x + 1) / 2) * rect.width, ((1 - v.y) / 2) * rect.height);
+  }
+
+  /** Build a dressing over the hand as it is now; it stays hidden until revealed. */
+  async buildLayer(layer: 'bandage' | 'cast'): Promise<void> {
+    const mesh = await this.builder.build(clonePose(this.pose), this.op ? { ...this.op } : null, FINE, layer);
+    const g = new THREE.BufferGeometry();
+    g.setAttribute('position', new THREE.BufferAttribute(mesh.positions, 3));
+    g.setAttribute('normal', new THREE.BufferAttribute(mesh.normals, 3));
+    const colors = mesh.colors;
+    for (let i = 0; i < colors.length; i++) colors[i] = srgbToLinear(colors[i]);
+    g.setAttribute('color', new THREE.BufferAttribute(colors, 3));
+    g.setIndex(new THREE.BufferAttribute(mesh.indices, 1));
+    this.layers[layer]?.geometry.dispose();
+    let m = this.layers[layer];
+    if (!m) {
+      m = new THREE.Mesh(g, dressingMaterial(layer, this.reveal[layer]));
+      m.castShadow = true;
+      m.receiveShadow = true;
+      this.layers[layer] = m;
+      this.hand.add(m);
+    } else m.geometry = g;
+  }
+
+  /** Show a dressing up to a height along the hand (cm from the wrist cut); -99 hides it. */
+  setReveal(layer: 'bandage' | 'cast', y: number) {
+    this.reveal[layer].value = y;
+  }
+
+  clearLayers() {
+    for (const m of Object.values(this.layers)) {
+      if (!m) continue;
+      this.hand.remove(m);
+      m.geometry.dispose();
+    }
+    this.layers = {};
+    this.reveal.bandage.value = this.reveal.cast.value = -99;
   }
 
   /** Sphere-trace a ray (hand frame) against the model's field. */
-  private march(o: THREE.Vector3, d: THREE.Vector3): THREE.Vector3 | null {
-    const fd = this.pickField;
+  private march(o: THREE.Vector3, d: THREE.Vector3, fd: Field | null = this.pickField): THREE.Vector3 | null {
     if (!fd) return null;
     let t = 0;
     for (let i = 0; i < 256 && t < 400; i++) {
@@ -307,45 +382,48 @@ export class HandView {
     return null;
   }
 
-  private pick(e: PointerEvent): THREE.Vector3 | null {
+  private pointerInfo(e: PointerEvent, kind: PointerKind): PointerInfo {
     const rect = this.renderer.domElement.getBoundingClientRect();
     const ndc = new THREE.Vector2(((e.clientX - rect.left) / rect.width) * 2 - 1, -((e.clientY - rect.top) / rect.height) * 2 + 1);
     const ray = new THREE.Raycaster();
     ray.setFromCamera(ndc, this.camera);
     const o = ray.ray.origin.clone().sub(this.hand.position);
-    return this.march(o, ray.ray.direction);
+    const hit = this.march(o, ray.ray.direction);
+    const hits = this.pickables.length ? ray.intersectObjects(this.pickables, true) : [];
+    // Walk up to the object that was registered as pickable.
+    let object: THREE.Object3D | null = hits[0]?.object ?? null;
+    while (object && !this.pickables.includes(object)) object = object.parent;
+    return { kind, hit, object, screen: new THREE.Vector2(e.clientX - rect.left, e.clientY - rect.top), pressed: this.dragging };
   }
 
   private setupPointer() {
     const el = this.renderer.domElement;
     el.addEventListener('pointerdown', (e) => {
       if (!this.tool) return;
-      const hit = this.pick(e);
-      if (!hit) return;
-      // Work on the skin rather than turning the model.
+      const info = this.pointerInfo(e, 'down');
+      if (!info.hit && !info.object) return;
+      // Work on the hand rather than turning the model.
       this.dragging = true;
+      info.pressed = true;
       this.controls.enabled = false;
       el.setPointerCapture(e.pointerId);
-      this.onPointer('down', hit);
+      this.onPointer(info);
     });
     el.addEventListener('pointermove', (e) => {
       if (!this.tool) return;
-      this.onPointer('move', this.pick(e));
+      this.onPointer(this.pointerInfo(e, 'move'));
     });
     const end = (e: PointerEvent) => {
       if (!this.dragging) return;
       this.dragging = false;
       this.controls.enabled = true;
-      this.onPointer('up', this.pick(e));
+      this.onPointer(this.pointerInfo(e, 'up'));
     };
     el.addEventListener('pointerup', end);
     el.addEventListener('pointercancel', end);
-    el.addEventListener('pointerleave', () => this.tool === 'scalpel' && !this.dragging && (this.scalpel.visible = false));
-  }
-
-  /** Whether the pointer is pressed on the skin with a tool. */
-  get pressing(): boolean {
-    return this.dragging;
+    el.addEventListener('pointerleave', () => {
+      if (!this.dragging) for (const t of Object.values(this.tools)) t.visible = false;
+    });
   }
 
   /** Move the camera closer (factor < 1) or further away along its current line. */
@@ -382,7 +460,7 @@ export class HandView {
 
   private receive(msg: { pose: HandPose; op: Operation | null; mesh: MeshData; h: number }) {
     const { mesh } = msg;
-    this.pickField = buildField(buildSkeleton(msg.pose, msg.op));
+    this.pickField = fieldFor(msg.pose, msg.op);
     this.bind = {
       pose: msg.pose,
       op: msg.op,
@@ -590,11 +668,14 @@ varying vec3 vShading;
 varying vec4 vCrease;
 varying vec3 vObjPos;
 varying vec3 vObjNormal;
-uniform vec2 uCut[4];
-uniform float uMarkLen;
-uniform float uCutLen;
-uniform vec2 uScar[4];
-uniform float uScarOn;
+#define MAX_SITES ${MAX_SITES}
+uniform vec3 uSiteO[MAX_SITES];
+uniform vec3 uSiteU[MAX_SITES];
+uniform vec3 uSiteV[MAX_SITES];
+uniform vec3 uSiteN[MAX_SITES];
+uniform vec4 uSiteL[MAX_SITES];
+uniform vec4 uSiteState[MAX_SITES];
+uniform int uSiteCount;
 
 float skinHash(vec3 p) {
   p = fract(p * 0.3183099 + vec3(0.1, 0.2, 0.3));
@@ -771,42 +852,106 @@ float pathDist(vec2 p, vec2 q0, vec2 q1, vec2 q2, vec2 q3, out float s) {
   return best;
 }
 
-// Surgical marker, the incision and the closed scar, drawn on the palm.
+// Surgical marker, the incision and the closed scar at each Z-plasty site.
 void surgeryMarks(inout vec3 col, inout float height) {
-  if (uMarkLen <= 0.0 && uCutLen <= 0.0 && uScarOn <= 0.0) return;
-  float facing = smoothstep(0.15, 0.45, vObjNormal.z) * step(-0.5, vCrease.w);
-  if (facing <= 0.0) return;
-  vec2 p = vObjPos.xy;
-  float s;
-  float d = pathDist(p, uCut[0], uCut[1], uCut[2], uCut[3], s);
-  if (s < uMarkLen) {
-    // Gentian violet from a skin marker: a soft line with a little ink variation.
-    float w = max(0.03, fwidth(d) * 1.5);
-    float ink = (1.0 - smoothstep(w * 0.45, w, d)) * (0.7 + 0.3 * skinNoise(vObjPos * 30.0));
-    col = mix(col, vec3(0.34, 0.18, 0.5), ink * 0.8 * facing);
-  }
-  if (s < uCutLen) {
-    // A clean incision: a fine dark line with a sliver of cut edge either side.
-    float w = max(0.012, fwidth(d) * 1.2);
-    float cut = 1.0 - smoothstep(w * 0.5, w, d);
-    float lip = (1.0 - smoothstep(w, w * 3.0, d)) * 0.35;
-    col = mix(col, vec3(0.78, 0.45, 0.42), lip * facing);
-    col = mix(col, vec3(0.36, 0.08, 0.08), cut * facing);
-    height -= (cut * 0.012 + lip * 0.004) * facing;
-  }
-  if (uScarOn > 0.0) {
-    float t;
-    float ds = pathDist(p, uScar[0], uScar[1], uScar[2], uScar[3], t);
-    float w = max(0.014, fwidth(ds) * 1.2);
-    float line = 1.0 - smoothstep(w * 0.5, w, ds);
-    float flush = (1.0 - smoothstep(w, 0.09, ds)) * 0.4;
-    col = mix(col, vec3(0.86, 0.55, 0.5), flush * facing);
-    col = mix(col, vec3(0.5, 0.18, 0.17), line * facing);
-    height -= line * 0.008 * facing;
+  if (uSiteCount == 0) return;
+  float skin = step(-0.5, vCrease.w);
+  for (int i = 0; i < MAX_SITES; i++) {
+    if (i >= uSiteCount) break;
+    vec3 rel = vObjPos - uSiteO[i];
+    float L = uSiteL[i].x;
+    // Only on this side of the hand, facing the way the site faces.
+    float facing = step(-uSiteL[i].y, dot(rel, uSiteN[i])) * smoothstep(0.0, 0.3, dot(vObjNormal, uSiteN[i])) * skin;
+    if (facing <= 0.0) continue;
+    vec2 p = vec2(dot(rel, uSiteU[i]), dot(rel, uSiteV[i]));
+    if (abs(p.x) > L * 1.2 || abs(p.y) > L * 1.2) continue;
+    vec4 st = uSiteState[i];
+    float h = L * 0.5;
+    float s60 = L * 0.8660254;
+    float s;
+    if (st.z > 0.5) {
+      // The closed, transposed Z.
+      float ds = pathDist(p, vec2(-s60, 0.0), vec2(0.0, h), vec2(0.0, -h), vec2(s60, 0.0), s);
+      float w = max(0.014, fwidth(ds) * 1.2);
+      float line = 1.0 - smoothstep(w * 0.5, w, ds);
+      float flush = (1.0 - smoothstep(w, 0.09, ds)) * 0.4;
+      col = mix(col, vec3(0.86, 0.55, 0.5), flush * facing);
+      col = mix(col, vec3(0.5, 0.18, 0.17), line * facing);
+      height -= line * 0.008 * facing;
+      continue;
+    }
+    float d = pathDist(p, vec2(0.0, -s60), vec2(-h, 0.0), vec2(h, 0.0), vec2(0.0, s60), s);
+    if (st.w > 0.5 && s > st.x) {
+      // A faint dotted guide for the marker.
+      float w = max(0.022, fwidth(d) * 1.5);
+      float dots = smoothstep(0.35, 0.5, fract(s * 7.0)) * (1.0 - smoothstep(0.8, 0.95, fract(s * 7.0)));
+      col = mix(col, vec3(0.42, 0.3, 0.55), (1.0 - smoothstep(w * 0.5, w, d)) * dots * 0.75 * facing);
+    }
+    if (s < st.x) {
+      // Gentian violet from a skin marker: a soft line with a little ink variation.
+      float w = max(0.03, fwidth(d) * 1.5);
+      float ink = (1.0 - smoothstep(w * 0.45, w, d)) * (0.7 + 0.3 * skinNoise(vObjPos * 30.0));
+      col = mix(col, vec3(0.34, 0.18, 0.5), ink * 0.8 * facing);
+    }
+    if (s < st.y) {
+      // A clean incision: a fine dark line with a sliver of cut edge either side.
+      float w = max(0.012, fwidth(d) * 1.2);
+      float cut = 1.0 - smoothstep(w * 0.5, w, d);
+      float lip = (1.0 - smoothstep(w, w * 3.0, d)) * 0.35;
+      col = mix(col, vec3(0.78, 0.45, 0.42), lip * facing);
+      col = mix(col, vec3(0.36, 0.08, 0.08), cut * facing);
+      height -= (cut * 0.012 + lip * 0.004) * facing;
+    }
   }
 }
 `;
 
 function srgbToLinear(c: number): number {
   return c < 0.04045 ? c * 0.0773993808 : Math.pow(c * 0.9478672986 + 0.0521327014, 2.4);
+}
+
+/**
+ * Crepe bandage or plaster of Paris, revealed from the wrist up to a height
+ * as it is applied. The bandage shows the overlapping edges of its turns.
+ */
+function dressingMaterial(layer: Layer, reveal: { value: number }): THREE.Material {
+  const m = new THREE.MeshStandardMaterial({ vertexColors: true, roughness: layer === 'cast' ? 0.95 : 0.85, metalness: 0 });
+  m.onBeforeCompile = (shader) => {
+    shader.uniforms.uReveal = reveal;
+    shader.vertexShader = shader.vertexShader
+      .replace('#include <common>', '#include <common>\nvarying vec3 vObjPos;')
+      .replace('#include <begin_vertex>', '#include <begin_vertex>\nvObjPos = position;');
+    shader.fragmentShader = shader.fragmentShader
+      .replace(
+        '#include <common>',
+        `#include <common>
+        uniform float uReveal;
+        varying vec3 vObjPos;
+        float dHash(vec3 p) { p = fract(p * 0.3183099 + 0.1); p *= 17.0; return fract(p.x * p.y * p.z * (p.x + p.y + p.z)); }`,
+      )
+      .replace(
+        '#include <clipping_planes_fragment>',
+        `#include <clipping_planes_fragment>
+        // The dressing is wound on from the wrist; its leading edge wobbles a little.
+        float edge = uReveal + 0.25 * sin(atan(vObjPos.z, vObjPos.x) * 1.0 + vObjPos.y);
+        if (vObjPos.y > edge) discard;`,
+      )
+      .replace(
+        '#include <color_fragment>',
+        `#include <color_fragment>
+        ${
+          layer === 'bandage'
+            ? `// Turns of the bandage: each overlaps the last, leaving a soft ridge.
+        float turn = fract((vObjPos.y + 0.35 * atan(vObjPos.z, vObjPos.x)) * 0.9);
+        diffuseColor.rgb *= 0.88 + 0.12 * smoothstep(0.0, 0.12, turn);
+        // The crinkled weave of crepe.
+        float weave = sin(vObjPos.y * 60.0 + sin(vObjPos.x * 9.0) * 2.0) * sin(vObjPos.x * 55.0 + vObjPos.z * 40.0);
+        diffuseColor.rgb *= 0.96 + 0.04 * weave;`
+            : `// Plaster: chalky, with the faint texture of the gauze it soaks into.
+        float grain = dHash(floor(vObjPos * 40.0));
+        diffuseColor.rgb *= 0.94 + 0.06 * grain;`
+        }`,
+      );
+  };
+  return m;
 }

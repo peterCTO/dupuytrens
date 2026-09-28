@@ -11,20 +11,26 @@ Tubiana stage.
 
 ![Palmar aspect](docs/screenshots/palmar.png)
 
-**Theatre** mode operates on the finger: a fasciectomy through a Z-plasty.
-Mark the Z in violet, trace the incision with the scalpel, raise the flaps and
-hold them with skin hooks, click the cord to excise it (the finger then
-straightens), transpose the flaps and place the sutures.
+**Theatre** mode is the operation, done by hand: a fasciectomy closed with
+Z-plasties, one in the palm over each palm cord and one on each finger with a
+middle-joint contracture. Mark each Z with the skin marker and cut it with the
+scalpel, peel back each triangular flap, draw the scalpel across each cord to
+divide it (the finger lets go as you cut), fold the flaps back so they swap
+places, sew each stitch, then wind on a crepe bandage and smooth a plaster
+slab along the back of the hand. Every step also has a button to do it for you.
 
 ![Theatre: the cord exposed](docs/screenshots/theatre-cord.png)
 
 ## Roadmap
 
-1. The model and the clinic: configure the contracture. *Done.*
-2. Theatre: fasciectomy with Z-plasty. *Done, first version.*
-3. Recovery: a physio stage with a hand specialist (hand therapist) after the
-   operation, covering splinting, scar care and exercises to keep the finger
-   straight.
+1. **Clinic**: configure the contracture. *Done.*
+2. **Theatre**: fasciectomy with Z-plasties, bandage and plaster. *Done, being refined.*
+3. **Hand therapy**, over several visits with a hand specialist:
+   - cut off the bandage and plaster, and clean the wounds;
+   - take out the stitches and look after the scars;
+   - mould a thermoplastic splint to hold the fingers straight, worn at night;
+   - a programme of exercises across later visits to keep the fingers straight
+     and get grip and bend back.
 
 ## Running it
 

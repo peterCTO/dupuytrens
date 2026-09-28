@@ -2,20 +2,21 @@
 // the work of one mesh (see builder.ts).
 
 import { buildSkeleton, HandPose, Operation } from './anatomy';
-import { buildField } from './sdf';
+import { buildField, Layer } from './sdf';
+import { fieldFor } from './surgery';
 import { extractSurface, gridFor, sampleSlab, shadeVertices } from './mesher';
 
 export type Job =
-  | { type: 'sample'; id: number; pose: HandPose; op: Operation | null; h: number; kb0: number; kb1: number }
-  | { type: 'surface'; id: number; pose: HandPose; op: Operation | null; h: number; values: Float32Array }
-  | { type: 'shade'; id: number; pose: HandPose; op: Operation | null; positions: Float32Array };
+  | { type: 'sample'; id: number; pose: HandPose; op: Operation | null; layer: Layer; h: number; kb0: number; kb1: number }
+  | { type: 'surface'; id: number; pose: HandPose; op: Operation | null; layer: Layer; h: number; values: Float32Array }
+  | { type: 'shade'; id: number; pose: HandPose; op: Operation | null; layer: Layer; positions: Float32Array };
 
 const post = (msg: unknown, transfer: Transferable[]) => (self as unknown as Worker).postMessage(msg, transfer);
 
 self.onmessage = (e: MessageEvent<Job>) => {
   const job = e.data;
   const sk = buildSkeleton(job.pose, job.op);
-  const fd = buildField(sk);
+  const fd = fieldFor(job.pose, job.op, job.layer);
   if (job.type === 'sample') {
     const values = sampleSlab(fd, gridFor(fd, job.h), job.kb0, job.kb1);
     post({ id: job.id, values }, [values.buffer]);

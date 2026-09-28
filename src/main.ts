@@ -42,7 +42,7 @@ function setMode(m: Mode) {
   document.getElementById('plate-no')!.textContent = theatreMode ? 'Plate II' : 'Plate I';
   document.getElementById('plate-title')!.innerHTML = theatreMode ? 'Fasciectomy with Z-plasty' : 'The Hand in Dupuytren&rsquo;s Contracture';
   for (const b of document.querySelectorAll<HTMLButtonElement>('#modes button')) b.classList.toggle('active', b.dataset.mode === m);
-  if (theatreMode) theatre.enter(active);
+  if (theatreMode) theatre.enter();
   else {
     theatre.leave();
     renderFingers();
@@ -277,6 +277,8 @@ if (params.get('zoom')) view.zoom(Number(params.get('zoom')));
 // ?mode=theatre&step=excise jumps straight to a step, for screenshots.
 if (params.get('mode') === 'theatre') {
   setMode('theatre');
+  // Exposed for the interaction tests.
+  if (params.has('debug')) Object.assign(window, { theatre, view });
   const step = params.get('step');
   if (step) theatre.skipTo(step);
 }

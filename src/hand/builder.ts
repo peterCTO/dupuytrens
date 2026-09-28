@@ -2,8 +2,9 @@
 // slabs in parallel, one worker extracts the surface, and the vertices are
 // then shaded in parallel chunks.
 
-import { buildSkeleton, HandPose, Operation } from './anatomy';
-import { buildField } from './sdf';
+import { HandPose, Operation } from './anatomy';
+import type { Layer } from './sdf';
+import { fieldFor } from './surgery';
 import { gridFor, MeshData, VertexData } from './mesher';
 import type { Job } from './worker';
 
@@ -36,22 +37,22 @@ export class MeshBuilder {
     });
   }
 
-  async build(pose: HandPose, op: Operation | null, h: number): Promise<MeshData> {
+  async build(pose: HandPose, op: Operation | null, h: number, layer: Layer = 'skin'): Promise<MeshData> {
     const n = this.workers.length;
-    const g = gridFor(buildField(buildSkeleton(pose, op)), h);
+    const g = gridFor(fieldFor(pose, op, layer), h);
     const sz = g.nx * g.ny;
 
     // Slabs of block rows, sampled in parallel and stitched together.
     const rows = Array.from({ length: n }, (_, i) => [Math.round((g.bz * i) / n), Math.round((g.bz * (i + 1)) / n)]);
     const slabs = await Promise.all(
-      rows.map(([kb0, kb1], i) => (kb1 > kb0 ? this.run(i, { type: 'sample', pose, op, h, kb0, kb1 }) : null)),
+      rows.map(([kb0, kb1], i) => (kb1 > kb0 ? this.run(i, { type: 'sample', pose, op, layer, h, kb0, kb1 }) : null)),
     );
     const values = new Float32Array(sz * g.nz);
     rows.forEach(([kb0], i) => {
       if (slabs[i]) values.set(slabs[i]!.values as Float32Array, kb0 * 4 * sz);
     });
 
-    const surface = await this.run(0, { type: 'surface', pose, op, h, values }, [values.buffer]);
+    const surface = await this.run(0, { type: 'surface', pose, op, layer, h, values }, [values.buffer]);
     const rough = surface.positions as Float32Array;
     const count = rough.length / 3;
 
@@ -59,7 +60,7 @@ export class MeshBuilder {
     const shaded = await Promise.all(
       chunks.map(([a, b], i) => {
         const positions = rough.slice(3 * a, 3 * b);
-        return this.run(i, { type: 'shade', pose, op, positions }, [positions.buffer]);
+        return this.run(i, { type: 'shade', pose, op, layer, positions }, [positions.buffer]);
       }),
     );
     const out: VertexData = {
