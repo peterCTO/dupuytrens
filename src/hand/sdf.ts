@@ -187,7 +187,7 @@ export function buildField(sk: Skeleton): Field {
     for (let i = 0; i + 1 < c.points.length; i++) {
       cords.push(makeCone(c.points[i], c.points[i + 1], c.radius * 1.15, c.radius * 0.8));
     }
-    nodules.push(makeEllipsoid(c.nodule, [0.42, 0.6, 0.32], [1, 0, 0], c.noduleAxis));
+    if (c.nodule) nodules.push(makeEllipsoid(c.nodule, [0.42, 0.6, 0.32], [1, 0, 0], c.noduleAxis));
   }
 
   // Bounds from all digit joints plus the palm and forearm.

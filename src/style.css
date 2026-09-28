@@ -264,3 +264,18 @@ h2 {
     font-size: 1.35rem;
   }
 }
+
+.tick {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.95rem;
+  cursor: pointer;
+}
+
+.tick input {
+  accent-color: var(--accent);
+  width: 16px;
+  height: 16px;
+  margin: 0;
+}

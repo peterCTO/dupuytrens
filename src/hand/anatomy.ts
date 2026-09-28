@@ -18,9 +18,21 @@ export interface FingerPose {
   pip: number;
   /** Distal interphalangeal flexion in degrees (negative is hyperextension). */
   dip: number;
-  /** Whether this ray has a Dupuytren's cord. */
+  /** Whether the finger itself is contracted (drives the joint sliders). */
   affected: boolean;
+  /** Palmar cord in this ray, independent of the finger contracture. */
+  cord: PalmCord;
 }
+
+export interface PalmCord {
+  present: boolean;
+  /** How far into the palm the cord begins, in cm back from the knuckle (MCP). */
+  start: number;
+  /** Length in cm; a cord longer than `start` runs on past the knuckle onto the finger. */
+  length: number;
+}
+
+export const NO_CORD: PalmCord = { present: false, start: 3, length: 2.5 };
 
 export type HandPose = Record<FingerId, FingerPose>;
 
@@ -76,7 +88,7 @@ export interface Digit {
 export interface Cord {
   points: Vec3[];
   radius: number;
-  nodule: Vec3;
+  nodule: Vec3 | null;
   noduleAxis: Vec3;
 }
 
@@ -147,19 +159,44 @@ function palmarPoint(s: Segment, t: number, inset: number): Vec3 {
   return add(lerp(s.a, s.b, t), scale(s.palmar, r - inset));
 }
 
-function cordFor(digit: Digit, pose: FingerPose): Cord {
+const PALM_DEPTH = 0.95;
+
+/** A point under the palmar skin, `back` cm proximal to the knuckle along the ray. */
+function palmPoint(digit: Digit, back: number): Vec3 {
   const mcp = digit.joints[0];
-  const severity = Math.min(1, (pose.mcp + pose.pip) / 120);
-  const radius = 0.3 + 0.12 * severity;
-  // The pretendinous cord arises in the palm and inserts on the proximal
-  // phalanx; a PIP contracture adds a central cord onto the middle phalanx.
-  // Under tension it bowstrings straight across the flexed joints.
-  const origin: Vec3 = [mcp[0] - 0.1, mcp[1] - 3.4, 0.9];
-  const points: Vec3[] = [origin];
-  points.push(palmarPoint(digit.segments[0], 0.4, 0.3));
-  if (pose.pip > 5) points.push(palmarPoint(digit.segments[1], 0.2, 0.3));
-  const nodule: Vec3 = [mcp[0] - 0.05, mcp[1] - 1.9, 1.25];
-  return { points, radius, nodule, noduleAxis: norm(sub(points[1], origin)) };
+  const p = sub(mcp, scale(digit.restAxis, back));
+  return [p[0], p[1], PALM_DEPTH];
+}
+
+function severity(pose: FingerPose): number {
+  return pose.affected ? Math.min(1, (pose.mcp + pose.pip) / 120) : 0;
+}
+
+// A pretendinous cord in the palm. If it is long enough to pass the knuckle
+// it inserts on the proximal phalanx and bowstrings straight across the MCP
+// joint when the finger is flexed.
+function palmCord(digit: Digit, pose: FingerPose): Cord {
+  const { start, length } = pose.cord;
+  const origin = palmPoint(digit, start);
+  const past = length - start;
+  const seg = digit.segments[0];
+  const segLen = Math.hypot(...sub(seg.b, seg.a));
+  const end = past > 0.3 ? palmarPoint(seg, Math.min(0.75, past / segLen), 0.3) : palmPoint(digit, Math.max(0.3, start - length));
+  const nodule = palmPoint(digit, Math.max(0.9, start - length));
+  nodule[2] = PALM_DEPTH + 0.3;
+  return {
+    points: [origin, end],
+    radius: 0.28 + 0.12 * severity(pose),
+    nodule,
+    noduleAxis: norm(sub(end, origin)),
+  };
+}
+
+// A digital (central) cord: a PIP contracture tethered along the proximal
+// phalanx onto the base of the middle phalanx, with or without a palm cord.
+function digitalCord(digit: Digit, pose: FingerPose): Cord {
+  const points = [palmarPoint(digit.segments[0], 0.25, 0.3), palmarPoint(digit.segments[1], 0.2, 0.3)];
+  return { points, radius: 0.24 + 0.1 * severity(pose), nodule: null, noduleAxis: norm(sub(points[1], points[0])) };
 }
 
 export function buildSkeleton(pose: HandPose): Skeleton {
@@ -168,7 +205,9 @@ export function buildSkeleton(pose: HandPose): Skeleton {
   for (const id of FINGER_IDS) {
     const digit = fingerDigit(id, pose[id]);
     digits.push(digit);
-    if (pose[id].affected) cords.push(cordFor(digit, pose[id]));
+    const p = pose[id];
+    if (p.cord.present) cords.push(palmCord(digit, p));
+    if (p.affected && p.pip > 5) cords.push(digitalCord(digit, p));
   }
   return { digits, cords };
 }
@@ -187,13 +226,13 @@ export function tubianaStage(p: FingerPose): { stage: string; note: string } {
   return { stage: 'IV', note: 'over 135° total deficit' };
 }
 
-export const RELAXED: FingerPose = { mcp: 6, pip: 10, dip: 5, affected: false };
+export const RELAXED: FingerPose = { mcp: 6, pip: 10, dip: 5, affected: false, cord: NO_CORD };
 
 export function defaultPose(): HandPose {
   return {
     index: { ...RELAXED, mcp: 4, pip: 7, dip: 4 },
     middle: { ...RELAXED },
-    ring: { mcp: 35, pip: 45, dip: 5, affected: true },
+    ring: { mcp: 35, pip: 45, dip: 5, affected: true, cord: { present: true, start: 2.5, length: 3 } },
     little: { ...RELAXED, mcp: 9, pip: 14, dip: 7 },
   };
 }
